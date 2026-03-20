@@ -8,7 +8,13 @@ ESP32-S3 SuperMini sketch that:
 
 ## Control modes
 
-Hold the BOOT button for ~1s to switch modes (the selection is saved and used on the next boot).
+Hold the BOOT button for ~5s to switch modes (the selection is saved and used on the next boot).
+
+LED indicator (if your board has a built-in LED):
+
+- Wi‑Fi AP: blue pulse
+- BLE: green double pulse (solid green when connected)
+- While holding BOOT: fast white blink (solid amber when ready to switch)
 
 - **Wi‑Fi AP mode**: connect to `ESP32-SuperMini`, then open `http://192.168.4.1/`.
 - **BLE mode**: advertises as `ESP32-S3 KBM` and accepts simple commands over the Nordic UART Service (NUS).

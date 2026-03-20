@@ -3,6 +3,7 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <NimBLEDevice.h>
+#include "esp32-hal-rgb-led.h"
 #include "USB.h"
 #include "USBHIDKeyboard.h"
 #include "USBHIDMouse.h"
@@ -18,7 +19,23 @@ static constexpr uint16_t HTTP_PORT = 80;
 // BOOT button is typically GPIO0 on ESP32-S3 dev boards (including many SuperMini variants).
 // Hold to switch between Wi-Fi AP control and BLE control.
 static constexpr uint8_t  BOOT_BUTTON_PIN = 0;
-static constexpr uint32_t MODE_TOGGLE_HOLD_MS = 1000;
+static constexpr uint32_t MODE_TOGGLE_HOLD_MS = 5000;
+
+// Optional: set to 1 if your LED is wired active-low.
+#ifndef MODE_LED_ACTIVE_LOW
+#define MODE_LED_ACTIVE_LOW 0
+#endif
+
+#if defined(RGB_BUILTIN)
+static constexpr int MODE_LED_PIN = RGB_BUILTIN;
+static constexpr bool MODE_LED_IS_RGB = true;
+#elif defined(LED_BUILTIN)
+static constexpr int MODE_LED_PIN = LED_BUILTIN;
+static constexpr bool MODE_LED_IS_RGB = false;
+#else
+static constexpr int MODE_LED_PIN = -1;
+static constexpr bool MODE_LED_IS_RGB = false;
+#endif
 
 DNSServer dnsServer;
 WebServer server(HTTP_PORT);
@@ -33,6 +50,9 @@ enum class ControlMode : uint8_t {
 
 static Preferences prefs;
 static ControlMode currentMode = ControlMode::WifiAp;
+static uint32_t buttonDownSince = 0;
+static bool buttonDown = false;
+static bool buttonArmed = false;
 
 // --- HTML & JAVASCRIPT FOR THE WEB UI ---
 static const char index_html[] PROGMEM = R"rawliteral(
@@ -214,6 +234,45 @@ static inline void send_ok_minimal() {
 
 static inline bool boot_button_down() {
   return digitalRead(BOOT_BUTTON_PIN) == LOW;
+}
+
+struct LedRgb {
+  uint8_t r = 0;
+  uint8_t g = 0;
+  uint8_t b = 0;
+};
+
+static LedRgb lastLed;
+
+static inline bool led_available() {
+  return MODE_LED_PIN >= 0;
+}
+
+static void set_led_rgb(uint8_t r, uint8_t g, uint8_t b) {
+  if (!led_available()) return;
+
+  // Avoid frequent WS2812 updates (and needless GPIO writes) if nothing changed.
+  if (lastLed.r == r && lastLed.g == g && lastLed.b == b) return;
+  lastLed = {r, g, b};
+
+  if (MODE_LED_IS_RGB) {
+    rgbLedWrite(static_cast<uint8_t>(MODE_LED_PIN), r, g, b);
+    return;
+  }
+
+  const bool on = (r | g | b) != 0;
+  const bool pinLevel = (MODE_LED_ACTIVE_LOW ? !on : on);
+  digitalWrite(MODE_LED_PIN, pinLevel ? HIGH : LOW);
+}
+
+static inline void led_off() {
+  set_led_rgb(0, 0, 0);
+}
+
+static void init_led() {
+  if (!led_available()) return;
+  if (!MODE_LED_IS_RGB) pinMode(MODE_LED_PIN, OUTPUT);
+  led_off();
 }
 
 static inline const char* mode_name(ControlMode m) {
@@ -454,30 +513,69 @@ static void maybe_toggle_mode_on_boot_hold() {
 }
 
 static void poll_mode_toggle_button() {
-  static bool wasDown = false;
-  static uint32_t downSince = 0;
-
   const bool down = boot_button_down();
-  if (down && !wasDown) {
-    downSince = millis();
-  } else if (!down && wasDown) {
-    const uint32_t held = millis() - downSince;
-    if (held >= MODE_TOGGLE_HOLD_MS) {
-      currentMode = toggled_mode(currentMode);
-      save_mode(currentMode);
-      Serial.print("Switching control mode to: ");
-      Serial.println(mode_name(currentMode));
-      delay(200);
-      ESP.restart();
-    }
+  if (down) {
+    if (!buttonDown) buttonDownSince = millis();
+    buttonDown = true;
+    buttonArmed = (millis() - buttonDownSince) >= MODE_TOGGLE_HOLD_MS;
+    return;
   }
 
-  wasDown = down;
+  // Released.
+  if (buttonDown && buttonArmed) {
+    currentMode = toggled_mode(currentMode);
+    save_mode(currentMode);
+    Serial.print("Switching control mode to: ");
+    Serial.println(mode_name(currentMode));
+    delay(200);
+    ESP.restart();
+  }
+  buttonDown = false;
+  buttonArmed = false;
+}
+
+static void update_mode_led() {
+  if (!led_available()) return;
+
+  const uint32_t now = millis();
+
+  // While BOOT is held, show a distinct "pending switch" indicator.
+  if (buttonDown) {
+    if (buttonArmed) {
+      // Ready: solid amber (release to switch)
+      set_led_rgb(48, 24, 0);
+    } else {
+      // Not ready yet: quick white blink
+      const bool on = ((now / 125U) % 2U) == 0U;
+      set_led_rgb(on ? 24 : 0, on ? 24 : 0, on ? 24 : 0);
+    }
+    return;
+  }
+
+  // Mode indicators:
+  // - Wi-Fi AP: blue pulse every 2s
+  // - BLE: green double pulse every 2s; solid green when connected
+  if (currentMode == ControlMode::WifiAp) {
+    const uint32_t t = now % 2000U;
+    const bool on = t < 120U;
+    set_led_rgb(0, 0, on ? 32 : 0);
+    return;
+  }
+
+  if (bleConnected) {
+    set_led_rgb(0, 32, 0);
+    return;
+  }
+
+  const uint32_t t = now % 2000U;
+  const bool on = (t < 120U) || (t >= 240U && t < 360U);
+  set_led_rgb(0, on ? 32 : 0, 0);
 }
 
 void setup() {
   Serial.begin(115200);
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+  init_led();
 
   currentMode = load_mode();
   maybe_toggle_mode_on_boot_hold();
@@ -496,6 +594,7 @@ void setup() {
 
 void loop() {
   poll_mode_toggle_button();
+  update_mode_led();
 
   if (currentMode == ControlMode::WifiAp) {
     dnsServer.processNextRequest();
