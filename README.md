@@ -2,7 +2,7 @@
 
 ESP32-S3 SuperMini sketch that:
 
-- Starts a Wi‑Fi Access Point with a captive portal-style redirect
+- Starts a Wi-Fi Access Point with a captive portal-style redirect
 - Serves a simple web UI (text input + trackpad)
 - Sends input to the connected USB host via USB HID (keyboard + mouse)
 
@@ -16,4 +16,3 @@ ESP32-S3 SuperMini sketch that:
 Arduino IDE (ESP32 core) + an ESP32-S3 board with USB device support.
 
 Open `esp32s3-wifi-kbm.ino`, select your ESP32-S3 board + port, then Upload.
-
