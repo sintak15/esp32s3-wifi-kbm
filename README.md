@@ -17,6 +17,7 @@ LED indicator (if your board has a built-in LED):
 - While holding BOOT: fast white blink (solid amber when ready to switch)
 
 - **Wi‑Fi AP mode**: connect to `ESP32-SuperMini`, then open `http://192.168.4.1/`.
+- **Wi‑Fi AP mode**: connect to `ESP32-SuperMini`, open `http://192.168.4.1/`, then sign in to the portal to access the controls.
 - **BLE mode**: advertises as `ESP32-S3 KBM` and accepts simple commands over the Nordic UART Service (NUS).
 
 BLE commands (write to the NUS RX characteristic):
@@ -29,6 +30,7 @@ BLE commands (write to the NUS RX characteristic):
 ## Notes
 
 - Use a strong AP password (8+ chars). The default is only for initial bring-up.
+- Change the portal password in `PORTAL_PASS` before use.
 - Only use on systems you own / have explicit permission to control.
 
 ## Build

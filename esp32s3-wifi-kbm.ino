@@ -3,6 +3,8 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <NimBLEDevice.h>
+#include <esp_system.h>
+#include <ctype.h>
 #include "esp32-hal-rgb-led.h"
 #include "USB.h"
 #include "USBHIDKeyboard.h"
@@ -12,6 +14,10 @@
 // Recommendation: change these before use.
 static constexpr const char* AP_SSID = "ESP32-SuperMini";
 static constexpr const char* AP_PASS = "password123";
+
+// Web portal password (separate from the AP password).
+// Set to "" to disable the portal sign-in requirement.
+static constexpr const char* PORTAL_PASS = "portal123";
 
 static constexpr uint8_t  DNS_PORT = 53;
 static constexpr uint16_t HTTP_PORT = 80;
@@ -53,6 +59,12 @@ static ControlMode currentMode = ControlMode::WifiAp;
 static uint32_t buttonDownSince = 0;
 static bool buttonDown = false;
 static bool buttonArmed = false;
+
+static char portalSessionHex[17] = {0};
+
+static inline bool portal_enabled() {
+  return (PORTAL_PASS != nullptr) && (PORTAL_PASS[0] != '\0');
+}
 
 // --- HTML & JAVASCRIPT FOR THE WEB UI ---
 static const char index_html[] PROGMEM = R"rawliteral(
@@ -101,7 +113,10 @@ static const char index_html[] PROGMEM = R"rawliteral(
 </head>
 <body>
   <div class="container">
-    <h2>ESP32 Input Control</h2>
+    <div style="display:flex; justify-content:space-between; align-items:center; gap:10px;">
+      <h2 style="margin: 5px 0;">ESP32 Input Control</h2>
+      <a href="/logout" style="color:#9ecbff; text-decoration:none; font-size:14px;">Sign out</a>
+    </div>
     <div class="input-row">
       <input type="text" id="textInput" placeholder="Type here...">
       <button style="width: 80px; flex: none;" onclick="sendText()">Send</button>
@@ -125,16 +140,26 @@ static const char index_html[] PROGMEM = R"rawliteral(
 
     const pad = document.getElementById('trackpad');
 
+    function authFetch(url) {
+      return fetch(url, { cache: 'no-store' }).then((r) => {
+        if (r.status === 401) {
+          window.location = '/';
+          throw new Error('auth');
+        }
+        return r;
+      });
+    }
+
     function sendText() {
       let text = document.getElementById('textInput').value;
       if(text.length > 0) {
-        fetch('/type?t=' + encodeURIComponent(text));
+        authFetch('/type?t=' + encodeURIComponent(text)).catch(() => {});
         document.getElementById('textInput').value = '';
       }
     }
 
     function sendClick(btn) {
-      fetch('/click?b=' + btn);
+      authFetch('/click?b=' + btn).catch(() => {});
     }
 
     function handlePointerDown(e) {
@@ -203,7 +228,7 @@ static const char index_html[] PROGMEM = R"rawliteral(
       accX -= tx;
       accY -= ty;
 
-      fetch('/move?x=' + tx + '&y=' + ty)
+      authFetch('/move?x=' + tx + '&y=' + ty)
         .then(() => {
           isSending = false;
           sendMoveQueue();
@@ -220,11 +245,88 @@ static const char index_html[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-static inline void send_ui_page() {
+static const char login_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>ESP32 Portal</title>
+  <style>
+    html, body {
+      width: 100%; height: 100%; margin: 0; padding: 0;
+      font-family: Arial, sans-serif;
+      background: #121212; color: white;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .card {
+      width: min(420px, calc(100% - 32px));
+      background: #1c1c1c;
+      border: 1px solid #2a2a2a;
+      border-radius: 12px;
+      padding: 18px;
+      box-sizing: border-box;
+      text-align: left;
+    }
+    h2 { margin: 0 0 10px 0; }
+    p { margin: 8px 0; color: #cfcfcf; }
+    input {
+      width: 100%;
+      padding: 12px;
+      font-size: 16px;
+      border-radius: 8px;
+      border: none;
+      margin-top: 10px;
+      box-sizing: border-box;
+    }
+    button {
+      width: 100%;
+      padding: 12px;
+      font-size: 16px;
+      border-radius: 8px;
+      border: none;
+      margin-top: 10px;
+      background: #007bff;
+      color: white;
+      cursor: pointer;
+    }
+    button:active { background: #0056b3; }
+    .err { display:none; margin-top: 10px; color: #ff6b6b; }
+    .hint { font-size: 12px; margin-top: 10px; color: #9a9a9a; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Sign in</h2>
+    <p>Enter the portal password to access the controls.</p>
+    <form method="POST" action="/login">
+      <input type="password" name="p" placeholder="Portal password" autofocus>
+      <button type="submit">Sign in</button>
+      <div class="err" id="err">Password was not accepted.</div>
+      <div class="hint">Tip: hold BOOT for 5s to switch to BLE mode.</div>
+    </form>
+  </div>
+  <script>
+    const e = new URLSearchParams(location.search).get('e');
+    if (e) document.getElementById('err').style.display = 'block';
+  </script>
+</body>
+</html>
+)rawliteral";
+
+static inline void send_no_cache_headers() {
   server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
   server.sendHeader("Pragma", "no-cache");
   server.sendHeader("Expires", "0");
+}
+
+static inline void send_ui_page() {
+  send_no_cache_headers();
   server.send_P(200, "text/html", index_html);
+}
+
+static inline void send_login_page() {
+  send_no_cache_headers();
+  server.send_P(200, "text/html", login_html);
 }
 
 static inline void send_ok_minimal() {
@@ -279,6 +381,65 @@ static inline const char* mode_name(ControlMode m) {
   return (m == ControlMode::Ble) ? "BLE" : "Wi-Fi AP";
 }
 
+static void generate_portal_session() {
+  if (!portal_enabled()) return;
+  const uint64_t r = (static_cast<uint64_t>(esp_random()) << 32) | static_cast<uint64_t>(esp_random());
+  snprintf(portalSessionHex, sizeof(portalSessionHex), "%016llx", static_cast<unsigned long long>(r));
+}
+
+static bool cookie_has_valid_session(const char* cookie) {
+  if (!portal_enabled()) return true;
+  if (portalSessionHex[0] == '\0') return false;
+  if (cookie == nullptr || cookie[0] == '\0') return false;
+
+  const size_t tokLen = strlen(portalSessionHex);
+  const char* p = cookie;
+  while ((p = strstr(p, "sid=")) != nullptr) {
+    p += 4;
+    while (*p == ' ') ++p;
+    size_t i = 0;
+    for (; i < tokLen; ++i) {
+      const char ch = p[i];
+      if (ch == '\0' || ch == ';' || ch == ' ') break;
+      if (static_cast<char>(tolower(static_cast<unsigned char>(ch))) != portalSessionHex[i]) break;
+    }
+    if (i == tokLen && (p[i] == '\0' || p[i] == ';' || p[i] == ' ')) return true;
+    p += 1;
+  }
+  return false;
+}
+
+static bool is_authenticated_request() {
+  if (!portal_enabled()) return true;
+  const String cookie = server.header("Cookie");
+  return cookie_has_valid_session(cookie.c_str());
+}
+
+static void set_session_cookie_and_redirect(const char* location) {
+  if (!portal_enabled()) {
+    server.sendHeader("Location", location, true);
+    server.send(303, "text/plain", "");
+    return;
+  }
+
+  String cookie;
+  cookie.reserve(96);
+  cookie += "sid=";
+  cookie += portalSessionHex;
+  cookie += "; Path=/; Max-Age=86400; SameSite=Lax; HttpOnly";
+  server.sendHeader("Set-Cookie", cookie, true);
+  server.sendHeader("Location", location, true);
+  server.send(303, "text/plain", "");
+}
+
+static void clear_session_cookie_and_redirect(const char* location) {
+  if (portal_enabled()) {
+    server.sendHeader("Set-Cookie", "sid=; Path=/; Max-Age=0; SameSite=Lax; HttpOnly", true);
+  }
+  server.sendHeader("Location", location, true);
+  server.send(303, "text/plain", "");
+}
+
 static ControlMode load_mode() {
   prefs.begin("kbm", true);
   const uint8_t raw = prefs.getUChar("mode", static_cast<uint8_t>(ControlMode::WifiAp));
@@ -302,6 +463,12 @@ static void start_wifi_control() {
   WiFi.softAP(AP_SSID, AP_PASS);
   WiFi.setSleep(false);
 
+  // We use a cookie for the portal session.
+  static const char* hdrs[] = {"Cookie"};
+  server.collectHeaders(hdrs, 1);
+
+  generate_portal_session();
+
   const IPAddress ip = WiFi.softAPIP();
   dnsServer.start(DNS_PORT, "*", ip);
 
@@ -311,11 +478,42 @@ static void start_wifi_control() {
   Serial.println(ip);
 
   // --- WEB SERVER ROUTING ---
-  server.on("/", send_ui_page);
-  server.on("/generate_204", send_ui_page);
-  server.on("/hotspot-detect.html", send_ui_page); // iOS/macOS
-  server.on("/connecttest.txt", send_ui_page);     // Windows
+  server.on("/", []() {
+    if (is_authenticated_request()) send_ui_page();
+    else send_login_page();
+  });
+  server.on("/generate_204", []() {
+    if (is_authenticated_request()) send_ui_page();
+    else send_login_page();
+  });
+  server.on("/hotspot-detect.html", []() { // iOS/macOS
+    if (is_authenticated_request()) send_ui_page();
+    else send_login_page();
+  });
+  server.on("/connecttest.txt", []() {     // Windows
+    if (is_authenticated_request()) send_ui_page();
+    else send_login_page();
+  });
   server.on("/favicon.ico", []() { server.send(204); });
+
+  server.on("/login", HTTP_GET, []() { send_login_page(); });
+
+  server.on("/login", HTTP_POST, []() {
+    if (!portal_enabled()) {
+      set_session_cookie_and_redirect("/");
+      return;
+    }
+    const String p = server.arg("p");
+    if (p.length() > 0 && p == PORTAL_PASS) {
+      generate_portal_session();
+      set_session_cookie_and_redirect("/");
+      return;
+    }
+    server.sendHeader("Location", "/login?e=1", true);
+    server.send(303, "text/plain", "");
+  });
+
+  server.on("/logout", HTTP_GET, []() { clear_session_cookie_and_redirect("/"); });
 
   server.onNotFound([ip]() {
     server.sendHeader("Location", String("http://") + ip.toString() + "/", true);
@@ -323,6 +521,10 @@ static void start_wifi_control() {
   });
 
   server.on("/move", []() {
+    if (!is_authenticated_request()) {
+      server.send(401, "text/plain", "Sign in required");
+      return;
+    }
     if (server.hasArg("x") && server.hasArg("y")) {
       int x = server.arg("x").toInt();
       int y = server.arg("y").toInt();
@@ -334,6 +536,10 @@ static void start_wifi_control() {
   });
 
   server.on("/click", []() {
+    if (!is_authenticated_request()) {
+      server.send(401, "text/plain", "Sign in required");
+      return;
+    }
     if (server.hasArg("b")) {
       const String btn = server.arg("b");
       if (btn == "left") Mouse.click(MOUSE_LEFT);
@@ -343,6 +549,10 @@ static void start_wifi_control() {
   });
 
   server.on("/type", []() {
+    if (!is_authenticated_request()) {
+      server.send(401, "text/plain", "Sign in required");
+      return;
+    }
     if (server.hasArg("t")) {
       String text = server.arg("t");
       if (text.length() > 256) text.remove(256);
