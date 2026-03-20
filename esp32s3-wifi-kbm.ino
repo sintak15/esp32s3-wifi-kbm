@@ -1,6 +1,8 @@
 #include <WiFi.h>
 #include <DNSServer.h>
 #include <WebServer.h>
+#include <Preferences.h>
+#include <NimBLEDevice.h>
 #include "USB.h"
 #include "USBHIDKeyboard.h"
 #include "USBHIDMouse.h"
@@ -13,11 +15,24 @@ static constexpr const char* AP_PASS = "password123";
 static constexpr uint8_t  DNS_PORT = 53;
 static constexpr uint16_t HTTP_PORT = 80;
 
+// BOOT button is typically GPIO0 on ESP32-S3 dev boards (including many SuperMini variants).
+// Hold to switch between Wi-Fi AP control and BLE control.
+static constexpr uint8_t  BOOT_BUTTON_PIN = 0;
+static constexpr uint32_t MODE_TOGGLE_HOLD_MS = 1000;
+
 DNSServer dnsServer;
 WebServer server(HTTP_PORT);
 
 USBHIDKeyboard Keyboard;
 USBHIDMouse Mouse;
+
+enum class ControlMode : uint8_t {
+  WifiAp = 0,
+  Ble = 1,
+};
+
+static Preferences prefs;
+static ControlMode currentMode = ControlMode::WifiAp;
 
 // --- HTML & JAVASCRIPT FOR THE WEB UI ---
 static const char index_html[] PROGMEM = R"rawliteral(
@@ -197,14 +212,33 @@ static inline void send_ok_minimal() {
   server.send(204);
 }
 
-void setup() {
-  Serial.begin(115200);
+static inline bool boot_button_down() {
+  return digitalRead(BOOT_BUTTON_PIN) == LOW;
+}
 
-  USB.begin();
-  Keyboard.begin();
-  Mouse.begin();
+static inline const char* mode_name(ControlMode m) {
+  return (m == ControlMode::Ble) ? "BLE" : "Wi-Fi AP";
+}
 
-  Serial.println("Starting Wi-Fi Access Point...");
+static ControlMode load_mode() {
+  prefs.begin("kbm", true);
+  const uint8_t raw = prefs.getUChar("mode", static_cast<uint8_t>(ControlMode::WifiAp));
+  prefs.end();
+  return (raw == static_cast<uint8_t>(ControlMode::Ble)) ? ControlMode::Ble : ControlMode::WifiAp;
+}
+
+static void save_mode(ControlMode m) {
+  prefs.begin("kbm", false);
+  prefs.putUChar("mode", static_cast<uint8_t>(m));
+  prefs.end();
+}
+
+static ControlMode toggled_mode(ControlMode m) {
+  return (m == ControlMode::WifiAp) ? ControlMode::Ble : ControlMode::WifiAp;
+}
+
+static void start_wifi_control() {
+  Serial.println("Starting control mode: Wi-Fi AP");
   WiFi.mode(WIFI_MODE_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
   WiFi.setSleep(false);
@@ -261,9 +295,212 @@ void setup() {
   server.begin();
 }
 
-void loop() {
-  dnsServer.processNextRequest();
-  server.handleClient();
-  delay(1); // yield to WiFi/USB stacks
+// --- BLE CONTROL (simple command protocol over BLE UART / NUS) ---
+static constexpr const char* BLE_DEVICE_NAME = "ESP32-S3 KBM";
+static constexpr const char* NUS_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
+static constexpr const char* NUS_RX_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"; // Write
+static constexpr const char* NUS_TX_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"; // Notify
+
+static NimBLECharacteristic* bleTx = nullptr;
+static bool bleConnected = false;
+
+static void ble_notify(const char* msg) {
+  if (!bleConnected || bleTx == nullptr) return;
+  bleTx->setValue(msg);
+  bleTx->notify();
 }
 
+static void handle_command_line(char* line) {
+  // Trim leading whitespace
+  while (*line == ' ' || *line == '\t' || *line == '\r' || *line == '\n') ++line;
+  if (*line == '\0') return;
+
+  // Uppercase first token
+  const char verb = static_cast<char>(toupper(static_cast<unsigned char>(line[0])));
+
+  // Commands:
+  //   M <dx> <dy>     Mouse move (ints, clamped to [-127,127])
+  //   C L|R           Click left/right
+  //   T <text...>     Type text (max 256 chars)
+  //   PING            Reply PONG
+  if (verb == 'P' && strncmp(line, "PING", 4) == 0) {
+    ble_notify("PONG\n");
+    return;
+  }
+
+  if (verb == 'M') {
+    char* p = line + 1;
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p == '\0') {
+      ble_notify("ERR missing dx/dy\n");
+      return;
+    }
+    char* end1 = nullptr;
+    long dx = strtol(p, &end1, 10);
+    if (end1 == p) {
+      ble_notify("ERR bad dx\n");
+      return;
+    }
+    p = end1;
+    while (*p == ' ' || *p == '\t') ++p;
+    char* end2 = nullptr;
+    long dy = strtol(p, &end2, 10);
+    if (end2 == p) {
+      ble_notify("ERR bad dy\n");
+      return;
+    }
+    dx = constrain(static_cast<int>(dx), -127, 127);
+    dy = constrain(static_cast<int>(dy), -127, 127);
+    Mouse.move(static_cast<int>(dx), static_cast<int>(dy));
+    return;
+  }
+
+  if (verb == 'C') {
+    char* p = line + 1;
+    while (*p == ' ' || *p == '\t') ++p;
+    const char which = static_cast<char>(toupper(static_cast<unsigned char>(*p)));
+    if (which == 'L') Mouse.click(MOUSE_LEFT);
+    else if (which == 'R') Mouse.click(MOUSE_RIGHT);
+    else ble_notify("ERR expected C L|R\n");
+    return;
+  }
+
+  if (verb == 'T') {
+    char* p = line + 1;
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p == '\0') return;
+    String text(p);
+    text.replace("\r", "");
+    text.replace("\n", "");
+    if (text.length() > 256) text.remove(256);
+    Keyboard.print(text);
+    return;
+  }
+
+  ble_notify("ERR unknown cmd\n");
+}
+
+class BleServerCallbacks final : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* s, NimBLEConnInfo& connInfo) override {
+    (void)s;
+    (void)connInfo;
+    bleConnected = true;
+    ble_notify("OK connected\n");
+  }
+
+  void onDisconnect(NimBLEServer* s, NimBLEConnInfo& connInfo, int reason) override {
+    (void)connInfo;
+    (void)reason;
+    bleConnected = false;
+    s->startAdvertising();
+  }
+};
+
+class BleRxCallbacks final : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
+    (void)connInfo;
+    std::string v = c->getValue();
+    if (v.empty()) return;
+
+    // Copy into a mutable buffer, strip trailing newlines, then parse.
+    static char buf[320];
+    size_t n = v.size();
+    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+    memcpy(buf, v.data(), n);
+    buf[n] = '\0';
+    while (n > 0 && (buf[n - 1] == '\r' || buf[n - 1] == '\n')) {
+      buf[n - 1] = '\0';
+      --n;
+    }
+    handle_command_line(buf);
+  }
+};
+
+static void start_ble_control() {
+  Serial.println("Starting control mode: BLE (NUS)");
+  WiFi.mode(WIFI_OFF);
+
+  NimBLEDevice::init(BLE_DEVICE_NAME);
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+
+  NimBLEServer* s = NimBLEDevice::createServer();
+  s->setCallbacks(new BleServerCallbacks());
+
+  NimBLEService* svc = s->createService(NUS_SERVICE_UUID);
+  bleTx = svc->createCharacteristic(NUS_TX_UUID, NIMBLE_PROPERTY::NOTIFY);
+  NimBLECharacteristic* rx =
+      svc->createCharacteristic(NUS_RX_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+  rx->setCallbacks(new BleRxCallbacks());
+  svc->start();
+
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  adv->addServiceUUID(NUS_SERVICE_UUID);
+  adv->start();
+}
+
+static void maybe_toggle_mode_on_boot_hold() {
+  if (!boot_button_down()) return;
+  const uint32_t start = millis();
+  while (boot_button_down() && (millis() - start < MODE_TOGGLE_HOLD_MS)) {
+    delay(10);
+  }
+  if (boot_button_down() && (millis() - start >= MODE_TOGGLE_HOLD_MS)) {
+    currentMode = toggled_mode(currentMode);
+    save_mode(currentMode);
+    Serial.print("Control mode set to: ");
+    Serial.println(mode_name(currentMode));
+    delay(200);
+  }
+}
+
+static void poll_mode_toggle_button() {
+  static bool wasDown = false;
+  static uint32_t downSince = 0;
+
+  const bool down = boot_button_down();
+  if (down && !wasDown) {
+    downSince = millis();
+  } else if (!down && wasDown) {
+    const uint32_t held = millis() - downSince;
+    if (held >= MODE_TOGGLE_HOLD_MS) {
+      currentMode = toggled_mode(currentMode);
+      save_mode(currentMode);
+      Serial.print("Switching control mode to: ");
+      Serial.println(mode_name(currentMode));
+      delay(200);
+      ESP.restart();
+    }
+  }
+
+  wasDown = down;
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+
+  currentMode = load_mode();
+  maybe_toggle_mode_on_boot_hold();
+
+  USB.begin();
+  Keyboard.begin();
+  Mouse.begin();
+
+  Serial.print("Current control mode: ");
+  Serial.println(mode_name(currentMode));
+  Serial.println("Hold BOOT for ~1s to switch modes.");
+
+  if (currentMode == ControlMode::Ble) start_ble_control();
+  else start_wifi_control();
+}
+
+void loop() {
+  poll_mode_toggle_button();
+
+  if (currentMode == ControlMode::WifiAp) {
+    dnsServer.processNextRequest();
+    server.handleClient();
+  }
+
+  delay(1); // yield to WiFi/BLE/USB stacks
+}
