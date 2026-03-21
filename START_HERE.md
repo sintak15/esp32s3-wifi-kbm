@@ -60,6 +60,7 @@ If Pair says unavailable, triple-tap BOOT again and retry quickly.
 
 - Triple-tap: open pairing window (~60 seconds)
 - Single tap: type current TOTP code (if configured)
+- Hold ~0.5-1.2 seconds: open physical-presence window for HSM actions
 - Hold about 2-4 seconds: unlock admin actions for Keys page (~60 seconds)
 - During WebAuthn/FIDO2 prompt: press and hold briefly to provide user presence
 
@@ -86,6 +87,10 @@ After signing into the portal, open `/keys`:
 
 Sensitive actions require admin unlock (hold BOOT about 2-4 seconds).
 
+Optional HSM page: open `/hsm` to generate an on-device P-256 key and sign/verify payloads.
+You can also set/unlock a device PIN there; when configured, FIDO requests can require that PIN unlock window.
+AP management page: open `/ap` to switch AP behavior between management-only and full-control mode.
+
 ## 10) Common Problems
 
 - Phone cannot open portal:
@@ -103,5 +108,8 @@ Sensitive actions require admin unlock (hold BOOT about 2-4 seconds).
 ## 11) Next Steps
 
 - Change default AP credentials in `esp32s3-wifi-kbm.ino`
-- Enable flash encryption for stronger at-rest protection
+- Enable flash encryption (development mode):
+  - Check status: `powershell -ExecutionPolicy Bypass -File .\tools\flash_encryption.ps1 -Action status`
+  - Enable + encrypted flash: `powershell -ExecutionPolicy Bypass -File .\tools\flash_encryption.ps1 -Action enable-dev`
+  - Future updates: `powershell -ExecutionPolicy Bypass -File .\tools\flash_encryption.ps1 -Action upload-encrypted`
 - Optionally enable FIDO debug logs by compiling with `-DFIDO_DEBUG=1`

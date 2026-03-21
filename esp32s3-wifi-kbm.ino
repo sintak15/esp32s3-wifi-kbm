@@ -26,7 +26,7 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);  // 16KB loop task stack
 // - 1: disable Wi-Fi portal runtime so USB/FIDO gets all CPU+power budget
 // - 0: run normal Wi-Fi portal + FIDO
 #ifndef FIDO_STABILITY_MODE
-#define FIDO_STABILITY_MODE 1
+#define FIDO_STABILITY_MODE 0
 #endif
 
 // USB mode switch:
@@ -55,14 +55,29 @@ static constexpr uint8_t  TOTP_DEFAULT_DIGITS = 6;
 static constexpr uint32_t TOTP_DEFAULT_PERIOD_S = 30;
 static constexpr size_t   TOTP_KEY_MAX_BYTES = 64;
 
+// HSM (P-256 / ES256) controls exposed over the authenticated web UI.
+static constexpr size_t   HSM_PRIVKEY_BYTES = 32;
+static constexpr size_t   HSM_PUBKEY_BYTES = 64; // X(32) || Y(32)
+static constexpr size_t   HSM_SIGNATURE_DER_MAX = 80;
+static constexpr size_t   HSM_SIGN_INPUT_MAX = 512;
+static constexpr uint32_t HSM_SIGN_COOLDOWN_MS = 250;
+static constexpr uint32_t HSM_PIN_UNLOCK_WINDOW_MS = 5 * 60 * 1000;
+static constexpr uint32_t HSM_PIN_PBKDF2_ITERS = 30000;
+static constexpr size_t   HSM_PIN_SALT_BYTES = 16;
+static constexpr size_t   HSM_PIN_HASH_BYTES = 32;
+static constexpr size_t   HSM_PIN_MIN_LEN = 4;
+static constexpr size_t   HSM_PIN_MAX_LEN = 64;
+static constexpr uint32_t HSM_PRESENCE_WINDOW_MS = 15 * 1000;
+static constexpr uint32_t HSM_PRESENCE_HOLD_MIN_MS = 500;
+static constexpr uint32_t HSM_PRESENCE_HOLD_MAX_MS = 1200;
+
 // Admin unlock (physical presence) gating for sensitive actions (delete/export/restore).
 // Hold BOOT for a few seconds to unlock briefly.
 static constexpr uint32_t ADMIN_UNLOCK_WINDOW_MS = 60 * 1000;
 static constexpr uint32_t ADMIN_UNLOCK_HOLD_MIN_MS = 1500;
 static constexpr uint32_t ADMIN_UNLOCK_HOLD_MAX_MS = 4500;
 
-// Credential inventory store (placeholder for future integration).
-// This sketch does not implement CTAP2/FIDO2/WebAuthn at this time.
+// Credential inventory store used by the Keys page.
 // Stored in NVS as a compact binary blob to allow listing/labeling/deletion and encrypted backup/restore.
 static constexpr uint32_t CRED_STORE_MAGIC = 0x314D424BU; // "KBM1" (little-endian)
 static constexpr uint16_t CRED_STORE_VERSION = 1;
@@ -137,6 +152,7 @@ static bool totpAppendEnter = false;
 
 static bool timeSynced = false;
 static int64_t timeOffsetUs = 0;
+static bool apManagementMode = false; // true = management-only AP (no /move /click /type)
 
 struct RestoreUploadState {
   uint8_t* buf = nullptr;
@@ -147,10 +163,28 @@ struct RestoreUploadState {
 
 static RestoreUploadState restoreUpload;
 
+struct HsmState {
+  bool loaded = false;
+  uint8_t priv[HSM_PRIVKEY_BYTES] = {0};
+  uint8_t pub[HSM_PUBKEY_BYTES] = {0}; // X || Y
+  uint32_t createdAt = 0;              // unix seconds if known, else 0
+  uint32_t signCount = 0;              // runtime counter (not persisted)
+  uint32_t lastSignMs = 0;
+};
+
+static HsmState hsmState;
+static bool hsmPinConfigured = false;
+static uint8_t hsmPinSalt[HSM_PIN_SALT_BYTES] = {0};
+static uint8_t hsmPinHash[HSM_PIN_HASH_BYTES] = {0};
+static uint32_t hsmPinUnlockedUntil = 0;
+static uint32_t hsmPresenceUntil = 0;
+
 // FIDO2/CTAP2 over USB HID (implemented in `fido2_ctap2.ino`).
 void fido_begin();
 void fido_task();
 bool fido_waiting_for_user_presence();
+void fido_diag_clear();
+void fido_diag_build_json(String& outJson);
 
 static bool usb_kbm_hid_enabled() {
   return USB_ENABLE_KBM_HID != 0;
@@ -251,7 +285,10 @@ static const char index_html[] PROGMEM = R"rawliteral(
     <div style="display:flex; justify-content:space-between; align-items:center; gap:10px;">
       <h2 style="margin: 5px 0;">ESP32 Input Control</h2>
       <div style="display:flex; gap:12px; align-items:center;">
+        <a href="/ap" style="color:#9ecbff; text-decoration:none; font-size:14px;">AP</a>
+        <a href="/diag" style="color:#9ecbff; text-decoration:none; font-size:14px;">Diag</a>
         <a href="/keys" style="color:#9ecbff; text-decoration:none; font-size:14px;">Keys</a>
+        <a href="/hsm" style="color:#9ecbff; text-decoration:none; font-size:14px;">HSM</a>
         <a href="/totp" style="color:#9ecbff; text-decoration:none; font-size:14px;">TOTP</a>
         <a href="/logout" style="color:#9ecbff; text-decoration:none; font-size:14px;">Sign out</a>
       </div>
@@ -543,7 +580,10 @@ static const char totp_html[] PROGMEM = R"rawliteral(
     <div class="top">
       <a href="/">← Back</a>
       <div style="display:flex; gap:12px; align-items:center;">
+        <a href="/ap">AP</a>
+        <a href="/diag">Diag</a>
         <a href="/keys">Keys</a>
+        <a href="/hsm">HSM</a>
         <a href="/logout">Sign out</a>
       </div>
     </div>
@@ -688,13 +728,16 @@ static const char keys_html[] PROGMEM = R"rawliteral(
     <div class="top">
       <a href="/">← Back</a>
       <div style="display:flex; gap:12px; align-items:center;">
+        <a href="/ap">AP</a>
+        <a href="/diag">Diag</a>
+        <a href="/hsm">HSM</a>
         <a href="/totp">TOTP</a>
         <a href="/logout">Sign out</a>
       </div>
     </div>
 
     <h2>Security Key</h2>
-    <p class="small">This sketch does not implement CTAP2/FIDO2/WebAuthn at this time.</p>
+    <p class="small">CTAP2/FIDO2 over USB HID is enabled. Use this page for credential inventory and backups.</p>
     <p class="small">Hold BOOT for ~2–4 seconds to unlock admin actions (delete / backup / restore) for about 60 seconds.</p>
 
     <div class="status" id="status">Loading…</div>
@@ -882,6 +925,601 @@ static const char keys_html[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
+static const char ap_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>ESP32 AP Management</title>
+  <style>
+    html, body {
+      width: 100%; height: 100%; margin: 0; padding: 0;
+      font-family: Arial, sans-serif;
+      background: #121212; color: white;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .card {
+      width: min(700px, calc(100% - 32px));
+      background: #1c1c1c;
+      border: 1px solid #2a2a2a;
+      border-radius: 12px;
+      padding: 18px;
+      box-sizing: border-box;
+      text-align: left;
+    }
+    .top { display:flex; justify-content:space-between; align-items:center; margin-bottom: 10px; }
+    a { color:#9ecbff; text-decoration:none; font-size:14px; }
+    h2 { margin: 0 0 10px 0; }
+    p { margin: 8px 0; color: #cfcfcf; }
+    .small { font-size: 12px; color: #9a9a9a; }
+    .status {
+      margin-top: 10px;
+      padding: 10px;
+      border: 1px solid #2a2a2a;
+      border-radius: 10px;
+      background: #171717;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 13px;
+      line-height: 1.4;
+      white-space: pre-wrap;
+    }
+    .row { display:flex; gap: 10px; margin-top: 12px; }
+    button {
+      width: 50%;
+      padding: 12px;
+      font-size: 15px;
+      border-radius: 8px;
+      border: none;
+      background: #007bff;
+      color: white;
+      cursor: pointer;
+    }
+    button:active { background: #0056b3; }
+    .msg { margin-top: 10px; color: #ffcc80; min-height: 20px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="top">
+      <a href="/">Back</a>
+      <div style="display:flex; gap:12px; align-items:center;">
+        <a href="/keys">Keys</a>
+        <a href="/diag">Diag</a>
+        <a href="/hsm">HSM</a>
+        <a href="/totp">TOTP</a>
+        <a href="/logout">Sign out</a>
+      </div>
+    </div>
+
+    <h2>AP Management Mode</h2>
+    <p class="small">Management-only mode blocks remote HID actions (`/move`, `/click`, `/type`) and keeps AP for admin pages.</p>
+    <p class="small">Changing mode requires admin unlock (hold BOOT ~2-4s).</p>
+
+    <div class="status" id="status">Loading...</div>
+    <div class="msg" id="msg"></div>
+
+    <div class="row">
+      <button type="button" onclick="setMode('manage')">Enable Management-Only</button>
+      <button type="button" onclick="setMode('control')">Enable Full Control</button>
+    </div>
+  </div>
+
+  <script>
+    async function api(url, opts) {
+      const r = await fetch(url, Object.assign({ cache: 'no-store' }, opts || {}));
+      if (r.status === 401) { window.location = '/'; throw new Error('auth'); }
+      return r;
+    }
+
+    function showMsg(t) {
+      document.getElementById('msg').textContent = t || '';
+    }
+
+    function fmtNullable(v) {
+      return (v === null || v === undefined || v === '') ? '' : String(v);
+    }
+
+    async function refresh() {
+      const stR = await api('/admin/status');
+      const apR = await api('/ap/status');
+      const st = await stR.json();
+      const ap = await apR.json();
+
+      const lines = [];
+      lines.push('mode: ' + (ap.mode || ''));
+      lines.push('ap_ssid: ' + (ap.ssid || ''));
+      lines.push('admin_unlocked: ' + (st.admin_unlocked ? 'yes' : 'no'));
+      lines.push('admin_seconds_remaining: ' + fmtNullable(st.admin_seconds_remaining));
+      lines.push('flash_encryption: ' + (st.flash_encryption ? 'enabled' : 'disabled'));
+      lines.push('usb_kbm_hid_enabled: ' + (ap.usb_kbm_hid_enabled ? 'yes' : 'no'));
+      document.getElementById('status').textContent = lines.join('\n');
+    }
+
+    async function setMode(mode) {
+      const body = new URLSearchParams();
+      body.set('mode', mode);
+      const r = await api('/ap/mode', {
+        method: 'POST',
+        headers: {'Content-Type':'application/x-www-form-urlencoded'},
+        body: body.toString()
+      });
+      const t = await r.text();
+      if (!r.ok) {
+        showMsg(t || 'AP mode change failed.');
+        return;
+      }
+      showMsg(t || 'AP mode updated.');
+      await refresh();
+    }
+
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>
+)rawliteral";
+
+static const char diag_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>ESP32 Diagnostics</title>
+  <style>
+    html, body {
+      width: 100%; height: 100%; margin: 0; padding: 0;
+      font-family: Arial, sans-serif;
+      background: #121212; color: white;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .card {
+      width: min(760px, calc(100% - 24px));
+      max-height: calc(100% - 24px);
+      overflow: auto;
+      background: #1c1c1c;
+      border: 1px solid #2a2a2a;
+      border-radius: 12px;
+      padding: 16px;
+      box-sizing: border-box;
+      text-align: left;
+    }
+    .top { display:flex; justify-content:space-between; align-items:center; margin-bottom: 10px; }
+    a { color:#9ecbff; text-decoration:none; font-size:14px; }
+    h2 { margin: 0 0 10px 0; }
+    .small { font-size: 12px; color: #9a9a9a; }
+    .status {
+      margin-top: 10px;
+      padding: 10px;
+      border: 1px solid #2a2a2a;
+      border-radius: 10px;
+      background: #171717;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 13px;
+      line-height: 1.4;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    button {
+      width: 100%;
+      padding: 12px;
+      font-size: 15px;
+      border-radius: 8px;
+      border: none;
+      margin-top: 12px;
+      background: #007bff;
+      color: white;
+      cursor: pointer;
+    }
+    button:active { background: #0056b3; }
+    .msg { margin-top: 10px; color: #ffcc80; min-height: 20px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="top">
+      <a href="/">Back</a>
+      <div style="display:flex; gap:12px; align-items:center;">
+        <a href="/ap">AP</a>
+        <a href="/keys">Keys</a>
+        <a href="/hsm">HSM</a>
+        <a href="/totp">TOTP</a>
+        <a href="/logout">Sign out</a>
+      </div>
+    </div>
+
+    <h2>Diagnostics</h2>
+    <p class="small">Live FIDO/CTAP diagnostics for troubleshooting registration/authentication and user-presence flow.</p>
+    <div class="status" id="status">Loading...</div>
+    <button type="button" onclick="resetDiag()">Reset counters</button>
+    <div class="msg" id="msg"></div>
+  </div>
+
+  <script>
+    async function api(url, opts) {
+      const r = await fetch(url, Object.assign({ cache: 'no-store' }, opts || {}));
+      if (r.status === 401) { window.location = '/'; throw new Error('auth'); }
+      return r;
+    }
+
+    function showMsg(t) {
+      document.getElementById('msg').textContent = t || '';
+    }
+
+    function fmt(v) {
+      return (v === null || v === undefined || v === '') ? '' : String(v);
+    }
+
+    async function refresh() {
+      const adR = await api('/admin/status');
+      const dgR = await api('/diag/status');
+      const ad = await adR.json();
+      const d = await dgR.json();
+
+      const lines = [];
+      lines.push('admin_unlocked: ' + (ad.admin_unlocked ? 'yes' : 'no'));
+      lines.push('admin_seconds_remaining: ' + fmt(ad.admin_seconds_remaining));
+      lines.push('flash_encryption: ' + (ad.flash_encryption ? 'enabled' : 'disabled'));
+      lines.push('last_cid: ' + fmt(d.last_cid));
+      lines.push('last_hid_cmd: ' + fmt(d.last_hid_cmd) + ' (' + (d.last_hid_cmd_name || '') + ')');
+      lines.push('last_ctap_cmd: ' + fmt(d.last_ctap_cmd) + ' (' + (d.last_ctap_cmd_name || '') + ')');
+      lines.push('last_ctap_status: ' + fmt(d.last_ctap_status) + ' (' + (d.last_ctap_status_name || '') + ')');
+      lines.push('last_hid_error: ' + fmt(d.last_hid_error) + ' (' + (d.last_hid_error_name || '') + ')');
+      lines.push('pending_waiting_up: ' + (d.pending_waiting_up ? 'yes' : 'no'));
+      lines.push('rx_ms_ago: ' + fmt(d.rx_ms_ago));
+      lines.push('tx_ms_ago: ' + fmt(d.tx_ms_ago));
+      lines.push('ctap_requests_total: ' + fmt(d.ctap_requests_total));
+      lines.push('ctap_ok_total: ' + fmt(d.ctap_ok_total));
+      lines.push('ctap_err_total: ' + fmt(d.ctap_err_total));
+      lines.push('pin_gate_blocks_total: ' + fmt(d.pin_gate_blocks_total));
+      lines.push('up_satisfied_total: ' + fmt(d.up_satisfied_total));
+      document.getElementById('status').textContent = lines.join('\n');
+    }
+
+    async function resetDiag() {
+      const r = await api('/diag/reset', { method: 'POST' });
+      const t = await r.text();
+      if (!r.ok) {
+        showMsg(t || 'Reset failed.');
+        return;
+      }
+      showMsg(t || 'Diagnostics counters reset.');
+      await refresh();
+    }
+
+    refresh();
+    setInterval(refresh, 1000);
+  </script>
+</body>
+</html>
+)rawliteral";
+
+static const char hsm_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>ESP32 HSM</title>
+  <style>
+    html, body {
+      width: 100%; height: 100%; margin: 0; padding: 0;
+      font-family: Arial, sans-serif;
+      background: #121212; color: white;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .card {
+      width: min(760px, calc(100% - 24px));
+      max-height: calc(100% - 24px);
+      overflow: auto;
+      background: #1c1c1c;
+      border: 1px solid #2a2a2a;
+      border-radius: 12px;
+      padding: 16px;
+      box-sizing: border-box;
+      text-align: left;
+    }
+    .top { display:flex; justify-content:space-between; align-items:center; margin-bottom: 10px; }
+    a { color:#9ecbff; text-decoration:none; font-size:14px; }
+    h2 { margin: 0 0 10px 0; }
+    h3 { margin: 16px 0 8px 0; font-size: 16px; }
+    p { margin: 8px 0; color: #cfcfcf; }
+    .small { font-size: 12px; color: #9a9a9a; }
+    label { display:block; margin-top: 10px; font-size: 13px; color:#cfcfcf; }
+    textarea, input[type="text"], input[type="password"], select {
+      width: 100%;
+      padding: 12px;
+      font-size: 14px;
+      border-radius: 8px;
+      border: none;
+      margin-top: 6px;
+      box-sizing: border-box;
+      background: #2a2a2a;
+      color: white;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+    button {
+      width: 100%;
+      padding: 12px;
+      font-size: 15px;
+      border-radius: 8px;
+      border: none;
+      margin-top: 12px;
+      background: #007bff;
+      color: white;
+      cursor: pointer;
+    }
+    button:active { background: #0056b3; }
+    .danger { background: #b00020; }
+    .danger:active { background: #7a0016; }
+    .status {
+      margin-top: 10px;
+      padding: 10px;
+      border: 1px solid #2a2a2a;
+      border-radius: 10px;
+      background: #171717;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 13px;
+      line-height: 1.4;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .msg { margin-top: 10px; color: #ffcc80; min-height: 20px; }
+    .row { display:flex; gap: 10px; }
+    .row button { width: 50%; }
+    .hint { margin-top: 10px; color:#9a9a9a; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="top">
+      <a href="/">Back</a>
+      <div style="display:flex; gap:12px; align-items:center;">
+        <a href="/ap">AP</a>
+        <a href="/diag">Diag</a>
+        <a href="/keys">Keys</a>
+        <a href="/totp">TOTP</a>
+        <a href="/logout">Sign out</a>
+      </div>
+    </div>
+
+    <h2>HSM (P-256 / ES256)</h2>
+    <p class="small">Use BOOT presence hold (~0.5-1.2s) plus PIN unlock for signing. Key management also requires admin unlock.</p>
+
+    <div class="status" id="status">Loading...</div>
+    <div class="msg" id="msg"></div>
+
+    <h3>PIN</h3>
+    <label for="pinCurrent">Current PIN</label>
+    <input id="pinCurrent" type="password" placeholder="Current PIN">
+    <label for="pinNew">New PIN (4-64 chars)</label>
+    <input id="pinNew" type="password" placeholder="New PIN">
+    <div class="row">
+      <button type="button" onclick="unlockPin()">Unlock PIN</button>
+      <button type="button" onclick="setPin()">Set / Change PIN</button>
+    </div>
+    <button class="danger" type="button" onclick="clearPin()">Clear PIN</button>
+
+    <h3>Key management</h3>
+    <div class="row">
+      <button type="button" onclick="generateKey()">Generate / Rotate key</button>
+      <button class="danger" type="button" onclick="deleteKey()">Delete key</button>
+    </div>
+
+    <h3>Sign</h3>
+    <label for="fmt">Input format</label>
+    <select id="fmt">
+      <option value="text">UTF-8 text</option>
+      <option value="hex">Hex bytes</option>
+      <option value="digesthex">SHA-256 digest (hex, 32 bytes)</option>
+    </select>
+    <label for="msgIn">Message / bytes</label>
+    <textarea id="msgIn" rows="4" placeholder="Example text or hex"></textarea>
+    <button type="button" onclick="signNow()">Sign with device key</button>
+    <div class="status" id="signOut"></div>
+
+    <h3>Verify</h3>
+    <label for="sigIn">Signature DER (hex)</label>
+    <textarea id="sigIn" rows="3" placeholder="Paste signature hex here"></textarea>
+    <button type="button" onclick="verifyNow()">Verify using current public key</button>
+    <div class="status" id="verifyOut"></div>
+
+    <div class="hint">Tip: HSM private key is stored in NVS. Enable flash encryption for stronger at-rest protection.</div>
+  </div>
+
+  <script>
+    async function api(url, opts) {
+      const r = await fetch(url, Object.assign({ cache: 'no-store' }, opts || {}));
+      if (r.status === 401) { window.location = '/'; throw new Error('auth'); }
+      return r;
+    }
+
+    function showMsg(t) {
+      document.getElementById('msg').textContent = t || '';
+    }
+
+    function fmtNullable(v) {
+      return (v === null || v === undefined || v === '') ? '' : String(v);
+    }
+
+    async function refresh() {
+      const stR = await api('/admin/status');
+      const hsR = await api('/hsm/status');
+      const st = await stR.json();
+      const hs = await hsR.json();
+
+      const lines = [];
+      lines.push('admin_unlocked: ' + (st.admin_unlocked ? 'yes' : 'no'));
+      lines.push('admin_seconds_remaining: ' + fmtNullable(st.admin_seconds_remaining));
+      lines.push('flash_encryption: ' + (st.flash_encryption ? 'enabled' : 'disabled'));
+      lines.push('key_present: ' + (hs.key_present ? 'yes' : 'no'));
+      lines.push('pin_configured: ' + (hs.pin_configured ? 'yes' : 'no'));
+      lines.push('pin_unlocked: ' + (hs.pin_unlocked ? 'yes' : 'no'));
+      lines.push('pin_seconds_remaining: ' + fmtNullable(hs.pin_seconds_remaining));
+      lines.push('presence_satisfied: ' + (hs.presence_satisfied ? 'yes' : 'no'));
+      lines.push('presence_seconds_remaining: ' + fmtNullable(hs.presence_seconds_remaining));
+      lines.push('algorithm: ' + (hs.algorithm || ''));
+      lines.push('curve: ' + (hs.curve || ''));
+      lines.push('created_unix: ' + fmtNullable(hs.created_unix));
+      lines.push('sign_count: ' + fmtNullable(hs.sign_count));
+      lines.push('pubkey_fingerprint: ' + (hs.pubkey_fingerprint || ''));
+      lines.push('public_key_hex: ' + (hs.public_key_hex || ''));
+      document.getElementById('status').textContent = lines.join('\n');
+    }
+
+    function pinCurrent() { return document.getElementById('pinCurrent').value || ''; }
+    function pinNew() { return document.getElementById('pinNew').value || ''; }
+
+    async function unlockPin() {
+      const body = new URLSearchParams();
+      body.set('p', pinCurrent());
+      const r = await api('/hsm/pin/unlock', {
+        method: 'POST',
+        headers: {'Content-Type':'application/x-www-form-urlencoded'},
+        body: body.toString()
+      });
+      const t = await r.text();
+      if (!r.ok) {
+        showMsg(t || 'PIN unlock failed.');
+        return;
+      }
+      showMsg('PIN unlocked.');
+      await refresh();
+    }
+
+    async function setPin() {
+      const body = new URLSearchParams();
+      body.set('p', pinCurrent());
+      body.set('n', pinNew());
+      const r = await api('/hsm/pin/set', {
+        method: 'POST',
+        headers: {'Content-Type':'application/x-www-form-urlencoded'},
+        body: body.toString()
+      });
+      const t = await r.text();
+      if (!r.ok) {
+        showMsg(t || 'PIN set failed.');
+        return;
+      }
+      document.getElementById('pinCurrent').value = '';
+      document.getElementById('pinNew').value = '';
+      showMsg('PIN saved.');
+      await refresh();
+    }
+
+    async function clearPin() {
+      if (!confirm('Clear the HSM PIN?')) return;
+      const body = new URLSearchParams();
+      body.set('p', pinCurrent());
+      const r = await api('/hsm/pin/clear', {
+        method: 'POST',
+        headers: {'Content-Type':'application/x-www-form-urlencoded'},
+        body: body.toString()
+      });
+      const t = await r.text();
+      if (!r.ok) {
+        showMsg(t || 'PIN clear failed.');
+        return;
+      }
+      document.getElementById('pinCurrent').value = '';
+      document.getElementById('pinNew').value = '';
+      showMsg('PIN cleared.');
+      await refresh();
+    }
+
+    async function generateKey() {
+      if (!confirm('Generate a new keypair and replace the current key?')) return;
+      const r = await api('/hsm/generate', { method: 'POST' });
+      const t = await r.text();
+      if (!r.ok) {
+        showMsg(t || 'Key generation was not accepted.');
+        return;
+      }
+      showMsg('New HSM key generated.');
+      await refresh();
+    }
+
+    async function deleteKey() {
+      if (!confirm('Delete the current HSM key? This cannot be undone.')) return;
+      const r = await api('/hsm/delete', { method: 'POST' });
+      const t = await r.text();
+      if (!r.ok) {
+        showMsg(t || 'Delete was not accepted.');
+        return;
+      }
+      showMsg('HSM key deleted.');
+      document.getElementById('signOut').textContent = '';
+      document.getElementById('verifyOut').textContent = '';
+      await refresh();
+    }
+
+    async function signNow() {
+      const body = new URLSearchParams();
+      body.set('fmt', document.getElementById('fmt').value);
+      body.set('m', document.getElementById('msgIn').value || '');
+      const r = await api('/hsm/sign', {
+        method: 'POST',
+        headers: {'Content-Type':'application/x-www-form-urlencoded'},
+        body: body.toString()
+      });
+      const t = await r.text();
+      if (!r.ok) {
+        showMsg(t || 'Sign request failed.');
+        return;
+      }
+
+      let j = null;
+      try { j = JSON.parse(t); } catch (_) {}
+      if (!j) {
+        showMsg('Sign response parse failed.');
+        return;
+      }
+
+      const lines = [];
+      lines.push('digest_hex: ' + (j.digest_hex || ''));
+      lines.push('signature_der_hex: ' + (j.signature_der_hex || ''));
+      lines.push('sign_count: ' + fmtNullable(j.sign_count));
+      document.getElementById('signOut').textContent = lines.join('\n');
+      document.getElementById('sigIn').value = j.signature_der_hex || '';
+      showMsg('Signature created.');
+      await refresh();
+    }
+
+    async function verifyNow() {
+      const body = new URLSearchParams();
+      body.set('fmt', document.getElementById('fmt').value);
+      body.set('m', document.getElementById('msgIn').value || '');
+      body.set('sig', document.getElementById('sigIn').value || '');
+      const r = await api('/hsm/verify', {
+        method: 'POST',
+        headers: {'Content-Type':'application/x-www-form-urlencoded'},
+        body: body.toString()
+      });
+      const t = await r.text();
+      if (!r.ok) {
+        showMsg(t || 'Verify request failed.');
+        return;
+      }
+
+      let j = null;
+      try { j = JSON.parse(t); } catch (_) {}
+      if (!j) {
+        showMsg('Verify response parse failed.');
+        return;
+      }
+
+      const lines = [];
+      lines.push('valid: ' + (j.valid ? 'yes' : 'no'));
+      lines.push('digest_hex: ' + (j.digest_hex || ''));
+      document.getElementById('verifyOut').textContent = lines.join('\n');
+      showMsg(j.valid ? 'Signature valid.' : 'Signature invalid.');
+    }
+
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>
+)rawliteral";
+
 static inline void send_no_cache_headers() {
   server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
   server.sendHeader("Pragma", "no-cache");
@@ -906,6 +1544,21 @@ static inline void send_totp_page() {
 static inline void send_keys_page() {
   send_no_cache_headers();
   server.send_P(200, "text/html", keys_html);
+}
+
+static inline void send_ap_page() {
+  send_no_cache_headers();
+  server.send_P(200, "text/html", ap_html);
+}
+
+static inline void send_diag_page() {
+  send_no_cache_headers();
+  server.send_P(200, "text/html", diag_html);
+}
+
+static inline void send_hsm_page() {
+  send_no_cache_headers();
+  server.send_P(200, "text/html", hsm_html);
 }
 
 static inline void send_ok_minimal() {
@@ -964,6 +1617,14 @@ static inline bool admin_unlocked() {
   return adminUnlockedUntil != 0 && (static_cast<int32_t>(adminUnlockedUntil - millis()) > 0);
 }
 
+static inline bool hsm_pin_unlocked() {
+  return hsmPinUnlockedUntil != 0 && (static_cast<int32_t>(hsmPinUnlockedUntil - millis()) > 0);
+}
+
+static inline bool hsm_presence_satisfied() {
+  return hsmPresenceUntil != 0 && (static_cast<int32_t>(hsmPresenceUntil - millis()) > 0);
+}
+
 static AttestationProfile load_attestation_profile() {
   prefs.begin("kbm", true);
   const uint8_t raw = prefs.getUChar("att", static_cast<uint8_t>(AttestationProfile::Diy));
@@ -977,6 +1638,36 @@ static void save_attestation_profile(AttestationProfile p) {
   prefs.putUChar("att", static_cast<uint8_t>(p));
   prefs.end();
   attestationProfile = p;
+}
+
+static bool load_ap_management_mode() {
+  prefs.begin("kbm", true);
+  const bool v = prefs.getBool("ap_mgmt", false);
+  prefs.end();
+  return v;
+}
+
+static void save_ap_management_mode(const bool enabled) {
+  prefs.begin("kbm", false);
+  prefs.putBool("ap_mgmt", enabled);
+  prefs.end();
+  apManagementMode = enabled;
+}
+
+static bool build_ap_status_json(String& outJson) {
+  outJson = "";
+  outJson.reserve(192);
+  outJson += "{";
+  outJson += "\"mode\":\"";
+  outJson += apManagementMode ? "manage" : "control";
+  outJson += "\"";
+  outJson += ",\"ssid\":\"";
+  outJson += AP_SSID;
+  outJson += "\"";
+  outJson += ",\"usb_kbm_hid_enabled\":";
+  outJson += (usb_kbm_hid_enabled() ? "true" : "false");
+  outJson += "}";
+  return true;
 }
 
 static void load_pair_token() {
@@ -1961,6 +2652,482 @@ static bool get_unix_seconds(uint64_t* unixSecondsOut) {
   return true;
 }
 
+static bool ct_equal(const uint8_t* a, const uint8_t* b, const size_t len) {
+  if (!a || !b) return false;
+  uint8_t diff = 0;
+  for (size_t i = 0; i < len; ++i) diff |= static_cast<uint8_t>(a[i] ^ b[i]);
+  return diff == 0;
+}
+
+static void hsm_mark_presence_now() {
+  hsmPresenceUntil = millis() + HSM_PRESENCE_WINDOW_MS;
+}
+
+static void hsm_consume_presence() {
+  hsmPresenceUntil = 0;
+}
+
+static bool hsm_pin_save_hash(const uint8_t salt[HSM_PIN_SALT_BYTES], const uint8_t hash[HSM_PIN_HASH_BYTES]) {
+  if (!salt || !hash) return false;
+  prefs.begin("kbm", false);
+  const size_t sw = prefs.putBytes("hsm_ps", salt, HSM_PIN_SALT_BYTES);
+  const size_t hw = prefs.putBytes("hsm_ph", hash, HSM_PIN_HASH_BYTES);
+  prefs.end();
+  return sw == HSM_PIN_SALT_BYTES && hw == HSM_PIN_HASH_BYTES;
+}
+
+static void hsm_pin_clear_local() {
+  hsmPinConfigured = false;
+  hsmPinUnlockedUntil = 0;
+  secure_zero(hsmPinSalt, sizeof(hsmPinSalt));
+  secure_zero(hsmPinHash, sizeof(hsmPinHash));
+}
+
+static void hsm_pin_clear_prefs() {
+  prefs.begin("kbm", false);
+  prefs.remove("hsm_ps");
+  prefs.remove("hsm_ph");
+  prefs.end();
+  hsm_pin_clear_local();
+}
+
+static bool hsm_pin_derive(const char* pin, const uint8_t* salt, const size_t saltLen, uint8_t outHash[HSM_PIN_HASH_BYTES]) {
+  if (!pin || !salt || !outHash) return false;
+  const size_t pinLen = strlen(pin);
+  if (pinLen < HSM_PIN_MIN_LEN || pinLen > HSM_PIN_MAX_LEN) return false;
+  const int rc = mbedtls_pkcs5_pbkdf2_hmac_ext(MBEDTLS_MD_SHA256, reinterpret_cast<const unsigned char*>(pin), pinLen, salt, saltLen,
+                                               HSM_PIN_PBKDF2_ITERS, HSM_PIN_HASH_BYTES, outHash);
+  return rc == 0;
+}
+
+static bool hsm_pin_verify(const char* pin) {
+  if (!hsmPinConfigured) return false;
+  uint8_t derived[HSM_PIN_HASH_BYTES] = {0};
+  if (!hsm_pin_derive(pin, hsmPinSalt, sizeof(hsmPinSalt), derived)) return false;
+  const bool ok = ct_equal(derived, hsmPinHash, sizeof(derived));
+  secure_zero(derived, sizeof(derived));
+  return ok;
+}
+
+static bool hsm_pin_set(const char* pin) {
+  if (!pin) return false;
+  uint8_t salt[HSM_PIN_SALT_BYTES] = {0};
+  uint8_t hash[HSM_PIN_HASH_BYTES] = {0};
+  esp_fill_random(salt, sizeof(salt));
+  if (!hsm_pin_derive(pin, salt, sizeof(salt), hash)) {
+    secure_zero(hash, sizeof(hash));
+    return false;
+  }
+  if (!hsm_pin_save_hash(salt, hash)) {
+    secure_zero(hash, sizeof(hash));
+    return false;
+  }
+  memcpy(hsmPinSalt, salt, sizeof(hsmPinSalt));
+  memcpy(hsmPinHash, hash, sizeof(hsmPinHash));
+  hsmPinConfigured = true;
+  hsmPinUnlockedUntil = millis() + HSM_PIN_UNLOCK_WINDOW_MS;
+  secure_zero(hash, sizeof(hash));
+  return true;
+}
+
+static bool hsm_pin_load_from_prefs() {
+  uint8_t salt[HSM_PIN_SALT_BYTES] = {0};
+  uint8_t hash[HSM_PIN_HASH_BYTES] = {0};
+  prefs.begin("kbm", true);
+  const size_t sl = prefs.getBytesLength("hsm_ps");
+  const size_t hl = prefs.getBytesLength("hsm_ph");
+  if (sl != HSM_PIN_SALT_BYTES || hl != HSM_PIN_HASH_BYTES) {
+    prefs.end();
+    hsm_pin_clear_local();
+    return false;
+  }
+  const size_t sg = prefs.getBytes("hsm_ps", salt, sizeof(salt));
+  const size_t hg = prefs.getBytes("hsm_ph", hash, sizeof(hash));
+  prefs.end();
+  if (sg != sizeof(salt) || hg != sizeof(hash)) {
+    hsm_pin_clear_prefs();
+    return false;
+  }
+  memcpy(hsmPinSalt, salt, sizeof(hsmPinSalt));
+  memcpy(hsmPinHash, hash, sizeof(hsmPinHash));
+  hsmPinConfigured = true;
+  hsmPinUnlockedUntil = 0;
+  return true;
+}
+
+static bool hsm_pin_unlock_with_pin(const char* pin) {
+  if (!hsmPinConfigured) return false;
+  if (!hsm_pin_verify(pin)) return false;
+  hsmPinUnlockedUntil = millis() + HSM_PIN_UNLOCK_WINDOW_MS;
+  return true;
+}
+
+// Shared policy hooks used by HSM and FIDO paths.
+bool security_pin_configured() {
+  return hsmPinConfigured;
+}
+
+bool security_pin_unlocked_now() {
+  return (!hsmPinConfigured) || hsm_pin_unlocked();
+}
+
+bool security_presence_satisfied_now() {
+  return hsm_presence_satisfied();
+}
+
+void security_presence_consume() {
+  hsm_consume_presence();
+}
+
+static int hsm_mbedtls_rng(void* ctx, unsigned char* out, const size_t len) {
+  (void)ctx;
+  esp_fill_random(out, len);
+  return 0;
+}
+
+static void hsm_clear_runtime() {
+  secure_zero(hsmState.priv, sizeof(hsmState.priv));
+  secure_zero(hsmState.pub, sizeof(hsmState.pub));
+  hsmState.loaded = false;
+  hsmState.createdAt = 0;
+  hsmState.signCount = 0;
+  hsmState.lastSignMs = 0;
+}
+
+static void hsm_delete_private_key_prefs() {
+  prefs.begin("kbm", false);
+  prefs.remove("hsm_prv");
+  prefs.remove("hsm_ct");
+  prefs.end();
+}
+
+static bool hsm_store_private_key(const uint8_t priv[HSM_PRIVKEY_BYTES], const uint32_t createdAt) {
+  if (!priv) return false;
+  prefs.begin("kbm", false);
+  const size_t wr = prefs.putBytes("hsm_prv", priv, HSM_PRIVKEY_BYTES);
+  prefs.putUInt("hsm_ct", createdAt);
+  prefs.end();
+  return wr == HSM_PRIVKEY_BYTES;
+}
+
+static bool hsm_compute_pub_from_priv(const uint8_t priv[HSM_PRIVKEY_BYTES], uint8_t outPub[HSM_PUBKEY_BYTES]) {
+  if (!priv || !outPub) return false;
+
+  mbedtls_ecp_keypair key;
+  mbedtls_ecp_keypair_init(&key);
+
+  if (mbedtls_ecp_read_key(MBEDTLS_ECP_DP_SECP256R1, &key, priv, HSM_PRIVKEY_BYTES) != 0) {
+    mbedtls_ecp_keypair_free(&key);
+    return false;
+  }
+  if (mbedtls_ecp_keypair_calc_public(&key, hsm_mbedtls_rng, nullptr) != 0) {
+    mbedtls_ecp_keypair_free(&key);
+    return false;
+  }
+
+  uint8_t pub[65] = {0};
+  size_t pubLen = 0;
+  const int rc = mbedtls_ecp_write_public_key(&key, MBEDTLS_ECP_PF_UNCOMPRESSED, &pubLen, pub, sizeof(pub));
+  mbedtls_ecp_keypair_free(&key);
+  if (rc != 0 || pubLen != sizeof(pub) || pub[0] != 0x04) return false;
+
+  memcpy(outPub, pub + 1, HSM_PUBKEY_BYTES);
+  return true;
+}
+
+static bool hsm_set_runtime_key(const uint8_t priv[HSM_PRIVKEY_BYTES], const uint32_t createdAt) {
+  uint8_t pub[HSM_PUBKEY_BYTES] = {0};
+  if (!hsm_compute_pub_from_priv(priv, pub)) return false;
+  memcpy(hsmState.priv, priv, HSM_PRIVKEY_BYTES);
+  memcpy(hsmState.pub, pub, HSM_PUBKEY_BYTES);
+  hsmState.loaded = true;
+  hsmState.createdAt = createdAt;
+  hsmState.signCount = 0;
+  hsmState.lastSignMs = 0;
+  return true;
+}
+
+static uint32_t hsm_now_unix_or_zero() {
+  uint64_t unixS = 0;
+  if (!get_unix_seconds(&unixS)) return 0;
+  if (unixS > UINT32_MAX) return 0;
+  return static_cast<uint32_t>(unixS);
+}
+
+static bool hsm_load_from_prefs() {
+  uint8_t priv[HSM_PRIVKEY_BYTES] = {0};
+
+  prefs.begin("kbm", true);
+  const size_t len = prefs.getBytesLength("hsm_prv");
+  if (len != HSM_PRIVKEY_BYTES) {
+    prefs.end();
+    hsm_clear_runtime();
+    return false;
+  }
+  const size_t got = prefs.getBytes("hsm_prv", priv, sizeof(priv));
+  const uint32_t createdAt = prefs.getUInt("hsm_ct", 0);
+  prefs.end();
+
+  if (got != HSM_PRIVKEY_BYTES) {
+    secure_zero(priv, sizeof(priv));
+    hsm_clear_runtime();
+    return false;
+  }
+
+  const bool ok = hsm_set_runtime_key(priv, createdAt);
+  secure_zero(priv, sizeof(priv));
+  if (!ok) {
+    hsm_delete_private_key_prefs();
+    hsm_clear_runtime();
+  }
+  return ok;
+}
+
+static bool hsm_generate_and_store_key() {
+  uint8_t priv[HSM_PRIVKEY_BYTES] = {0};
+  uint8_t pub[65] = {0};
+
+  mbedtls_ecp_keypair key;
+  mbedtls_ecp_keypair_init(&key);
+  const int rc = mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, &key, hsm_mbedtls_rng, nullptr);
+  if (rc != 0) {
+    mbedtls_ecp_keypair_free(&key);
+    return false;
+  }
+
+  size_t privLen = 0;
+  if (mbedtls_ecp_write_key_ext(&key, &privLen, priv, sizeof(priv)) != 0 || privLen != sizeof(priv)) {
+    mbedtls_ecp_keypair_free(&key);
+    secure_zero(priv, sizeof(priv));
+    return false;
+  }
+
+  size_t pubLen = 0;
+  if (mbedtls_ecp_write_public_key(&key, MBEDTLS_ECP_PF_UNCOMPRESSED, &pubLen, pub, sizeof(pub)) != 0 || pubLen != sizeof(pub) ||
+      pub[0] != 0x04) {
+    mbedtls_ecp_keypair_free(&key);
+    secure_zero(priv, sizeof(priv));
+    return false;
+  }
+  mbedtls_ecp_keypair_free(&key);
+
+  const uint32_t createdAt = hsm_now_unix_or_zero();
+  const bool stored = hsm_store_private_key(priv, createdAt);
+  if (!stored) {
+    secure_zero(priv, sizeof(priv));
+    return false;
+  }
+
+  const bool loaded = hsm_set_runtime_key(priv, createdAt);
+  secure_zero(priv, sizeof(priv));
+  if (!loaded) {
+    hsm_delete_private_key_prefs();
+    hsm_clear_runtime();
+    return false;
+  }
+  return true;
+}
+
+static bool hsm_delete_key() {
+  hsm_delete_private_key_prefs();
+  hsm_clear_runtime();
+  return true;
+}
+
+static bool hsm_digest_from_form_input(const String& fmt, const String& value, uint8_t outDigest[32], size_t* inputLenOut) {
+  if (!outDigest) return false;
+  if (inputLenOut) *inputLenOut = 0;
+
+  String mode = fmt;
+  mode.trim();
+  mode.toLowerCase();
+
+  if (mode.length() == 0 || mode == "text") {
+    if (value.length() > HSM_SIGN_INPUT_MAX) return false;
+    const uint8_t* msg = reinterpret_cast<const uint8_t*>(value.c_str());
+    const size_t msgLen = value.length();
+    if (mbedtls_sha256(msg, msgLen, outDigest, 0) != 0) return false;
+    if (inputLenOut) *inputLenOut = msgLen;
+    return true;
+  }
+
+  if (mode == "hex") {
+    if (value.length() == 0 || (value.length() % 2) != 0) return false;
+    uint8_t tmp[HSM_SIGN_INPUT_MAX] = {0};
+    const size_t n = hex_to_bytes(value.c_str(), tmp, sizeof(tmp));
+    if (n == 0) return false;
+    const bool ok = (mbedtls_sha256(tmp, n, outDigest, 0) == 0);
+    secure_zero(tmp, sizeof(tmp));
+    if (!ok) return false;
+    if (inputLenOut) *inputLenOut = n;
+    return true;
+  }
+
+  if (mode == "digesthex") {
+    uint8_t tmp[32] = {0};
+    const size_t n = hex_to_bytes(value.c_str(), tmp, sizeof(tmp));
+    if (n != sizeof(tmp)) {
+      secure_zero(tmp, sizeof(tmp));
+      return false;
+    }
+    memcpy(outDigest, tmp, sizeof(tmp));
+    secure_zero(tmp, sizeof(tmp));
+    if (inputLenOut) *inputLenOut = 32;
+    return true;
+  }
+
+  return false;
+}
+
+static bool hsm_sign_digest_der(const uint8_t digest[32], uint8_t* sigOut, const size_t sigOutMax, size_t* sigLenOut) {
+  if (sigLenOut) *sigLenOut = 0;
+  if (!digest || !sigOut || !sigLenOut) return false;
+  if (!hsmState.loaded) return false;
+  if (sigOutMax < 8) return false;
+
+  const uint32_t now = millis();
+  if (hsmState.lastSignMs != 0 &&
+      static_cast<int32_t>(now - hsmState.lastSignMs) < static_cast<int32_t>(HSM_SIGN_COOLDOWN_MS)) {
+    return false;
+  }
+
+  mbedtls_ecp_keypair key;
+  mbedtls_ecp_keypair_init(&key);
+  if (mbedtls_ecp_read_key(MBEDTLS_ECP_DP_SECP256R1, &key, hsmState.priv, HSM_PRIVKEY_BYTES) != 0) {
+    mbedtls_ecp_keypair_free(&key);
+    return false;
+  }
+  if (mbedtls_ecp_keypair_calc_public(&key, hsm_mbedtls_rng, nullptr) != 0) {
+    mbedtls_ecp_keypair_free(&key);
+    return false;
+  }
+
+  mbedtls_ecdsa_context ecdsa;
+  mbedtls_ecdsa_init(&ecdsa);
+  if (mbedtls_ecdsa_from_keypair(&ecdsa, &key) != 0) {
+    mbedtls_ecdsa_free(&ecdsa);
+    mbedtls_ecp_keypair_free(&key);
+    return false;
+  }
+
+  size_t sigLen = 0;
+  const int rc = mbedtls_ecdsa_write_signature(&ecdsa, MBEDTLS_MD_SHA256, digest, 32, sigOut, sigOutMax, &sigLen, hsm_mbedtls_rng,
+                                               nullptr);
+  mbedtls_ecdsa_free(&ecdsa);
+  mbedtls_ecp_keypair_free(&key);
+  if (rc != 0 || sigLen == 0 || sigLen > sigOutMax) return false;
+
+  *sigLenOut = sigLen;
+  hsmState.lastSignMs = now;
+  hsmState.signCount++;
+  return true;
+}
+
+static bool hsm_verify_digest_der(const uint8_t digest[32], const uint8_t* sigDer, const size_t sigDerLen) {
+  if (!digest || !sigDer || sigDerLen == 0) return false;
+  if (!hsmState.loaded) return false;
+
+  mbedtls_ecp_keypair key;
+  mbedtls_ecp_keypair_init(&key);
+  if (mbedtls_ecp_read_key(MBEDTLS_ECP_DP_SECP256R1, &key, hsmState.priv, HSM_PRIVKEY_BYTES) != 0) {
+    mbedtls_ecp_keypair_free(&key);
+    return false;
+  }
+  if (mbedtls_ecp_keypair_calc_public(&key, hsm_mbedtls_rng, nullptr) != 0) {
+    mbedtls_ecp_keypair_free(&key);
+    return false;
+  }
+
+  mbedtls_ecdsa_context ecdsa;
+  mbedtls_ecdsa_init(&ecdsa);
+  if (mbedtls_ecdsa_from_keypair(&ecdsa, &key) != 0) {
+    mbedtls_ecdsa_free(&ecdsa);
+    mbedtls_ecp_keypair_free(&key);
+    return false;
+  }
+  const int rc = mbedtls_ecdsa_read_signature(&ecdsa, digest, 32, sigDer, sigDerLen);
+  mbedtls_ecdsa_free(&ecdsa);
+  mbedtls_ecp_keypair_free(&key);
+  return rc == 0;
+}
+
+static void hsm_public_key_uncompressed(uint8_t out65[65]) {
+  if (!out65) return;
+  memset(out65, 0, 65);
+  if (!hsmState.loaded) return;
+  out65[0] = 0x04;
+  memcpy(out65 + 1, hsmState.pub, HSM_PUBKEY_BYTES);
+}
+
+static void hsm_pubkey_hex(char* out, const size_t outLen) {
+  uint8_t pub[65] = {0};
+  hsm_public_key_uncompressed(pub);
+  bytes_to_hex(pub, hsmState.loaded ? sizeof(pub) : 0, out, outLen);
+}
+
+static void hsm_pubkey_fingerprint_hex(char* out, const size_t outLen) {
+  if (!out || outLen == 0) return;
+  out[0] = '\0';
+  if (!hsmState.loaded) return;
+
+  uint8_t pub[65] = {0};
+  uint8_t hash[32] = {0};
+  hsm_public_key_uncompressed(pub);
+  if (mbedtls_sha256(pub, sizeof(pub), hash, 0) != 0) return;
+  // 8-byte short fingerprint (16 hex chars) for quick visual checks.
+  bytes_to_hex(hash, 8, out, outLen);
+}
+
+static bool build_hsm_status_json(String& outJson) {
+  char pubHex[(65 * 2) + 1] = {0};
+  char fpHex[(8 * 2) + 1] = {0};
+  uint32_t pinRem = 0;
+  if (hsm_pin_unlocked()) {
+    const uint32_t now = millis();
+    pinRem = static_cast<uint32_t>((hsmPinUnlockedUntil > now) ? ((hsmPinUnlockedUntil - now) / 1000U) : 0U);
+  }
+  uint32_t presenceRem = 0;
+  if (hsm_presence_satisfied()) {
+    const uint32_t now = millis();
+    presenceRem = static_cast<uint32_t>((hsmPresenceUntil > now) ? ((hsmPresenceUntil - now) / 1000U) : 0U);
+  }
+
+  if (hsmState.loaded) {
+    hsm_pubkey_hex(pubHex, sizeof(pubHex));
+    hsm_pubkey_fingerprint_hex(fpHex, sizeof(fpHex));
+  }
+
+  outJson = "";
+  outJson.reserve(520);
+  outJson += "{";
+  outJson += "\"key_present\":";
+  outJson += (hsmState.loaded ? "true" : "false");
+  outJson += ",\"algorithm\":\"ES256\"";
+  outJson += ",\"curve\":\"P-256\"";
+  outJson += ",\"created_unix\":";
+  outJson += (hsmState.loaded && hsmState.createdAt > 0) ? String(hsmState.createdAt) : String("null");
+  outJson += ",\"sign_count\":";
+  outJson += String(hsmState.signCount);
+  outJson += ",\"pubkey_fingerprint\":\"";
+  if (hsmState.loaded) outJson += fpHex;
+  outJson += "\"";
+  outJson += ",\"public_key_hex\":\"";
+  if (hsmState.loaded) outJson += pubHex;
+  outJson += "\"";
+  outJson += ",\"pin_configured\":";
+  outJson += (hsmPinConfigured ? "true" : "false");
+  outJson += ",\"pin_unlocked\":";
+  outJson += (hsm_pin_unlocked() ? "true" : "false");
+  outJson += ",\"pin_seconds_remaining\":";
+  outJson += hsm_pin_unlocked() ? String(pinRem) : String("null");
+  outJson += ",\"presence_satisfied\":";
+  outJson += (hsm_presence_satisfied() ? "true" : "false");
+  outJson += ",\"presence_seconds_remaining\":";
+  outJson += hsm_presence_satisfied() ? String(presenceRem) : String("null");
+  outJson += "}";
+  return true;
+}
+
 static bool hmac_sha1(const uint8_t* key, const size_t keyLen, const uint8_t* msg, const size_t msgLen, uint8_t out20[20]) {
   const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA1);
   if (info == nullptr) return false;
@@ -2057,19 +3224,31 @@ static void start_wifi_control() {
 
   // --- WEB SERVER ROUTING ---
   server.on("/", []() {
-    if (is_authenticated_request()) send_ui_page();
+    if (is_authenticated_request()) {
+      if (apManagementMode) send_ap_page();
+      else send_ui_page();
+    }
     else send_login_page();
   });
   server.on("/generate_204", []() {
-    if (is_authenticated_request()) send_ui_page();
+    if (is_authenticated_request()) {
+      if (apManagementMode) send_ap_page();
+      else send_ui_page();
+    }
     else send_login_page();
   });
   server.on("/hotspot-detect.html", []() { // iOS/macOS
-    if (is_authenticated_request()) send_ui_page();
+    if (is_authenticated_request()) {
+      if (apManagementMode) send_ap_page();
+      else send_ui_page();
+    }
     else send_login_page();
   });
   server.on("/connecttest.txt", []() {     // Windows
-    if (is_authenticated_request()) send_ui_page();
+    if (is_authenticated_request()) {
+      if (apManagementMode) send_ap_page();
+      else send_ui_page();
+    }
     else send_login_page();
   });
   server.on("/favicon.ico", []() { server.send(204); });
@@ -2190,6 +3369,371 @@ static void start_wifi_control() {
       return;
     }
     send_keys_page();
+  });
+
+  server.on("/ap", HTTP_GET, []() {
+    if (!is_authenticated_request()) {
+      send_login_page();
+      return;
+    }
+    send_ap_page();
+  });
+
+  server.on("/diag", HTTP_GET, []() {
+    if (!is_authenticated_request()) {
+      send_login_page();
+      return;
+    }
+    send_diag_page();
+  });
+
+  server.on("/diag/status", HTTP_GET, []() {
+    if (!is_authenticated_request()) {
+      server.send(401, "application/json", "{\"error\":\"auth\"}");
+      return;
+    }
+    String json;
+    fido_diag_build_json(json);
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/diag/reset", HTTP_POST, []() {
+    if (!is_authenticated_request()) {
+      server.send(401, "text/plain", "Sign in required");
+      return;
+    }
+    if (!admin_unlocked()) {
+      server.send(403, "text/plain", "Admin actions locked (hold BOOT ~2-4s to unlock).");
+      return;
+    }
+    fido_diag_clear();
+    server.send(200, "text/plain", "Diagnostics reset");
+  });
+
+  server.on("/ap/status", HTTP_GET, []() {
+    if (!is_authenticated_request()) {
+      server.send(401, "application/json", "{\"error\":\"auth\"}");
+      return;
+    }
+    String json;
+    if (!build_ap_status_json(json)) {
+      server.send(500, "application/json", "{\"error\":\"ap\"}");
+      return;
+    }
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/ap/mode", HTTP_POST, []() {
+    if (!is_authenticated_request()) {
+      server.send(401, "text/plain", "Sign in required");
+      return;
+    }
+    if (!admin_unlocked()) {
+      server.send(403, "text/plain", "Admin actions locked (hold BOOT ~2-4s to unlock).");
+      return;
+    }
+    const String mode = server.arg("mode");
+    if (mode == "manage") {
+      save_ap_management_mode(true);
+      server.send(200, "text/plain", "AP mode set to management-only");
+      return;
+    }
+    if (mode == "control") {
+      save_ap_management_mode(false);
+      server.send(200, "text/plain", "AP mode set to full control");
+      return;
+    }
+    server.send(400, "text/plain", "Invalid mode");
+  });
+
+  server.on("/hsm", HTTP_GET, []() {
+    if (!is_authenticated_request()) {
+      send_login_page();
+      return;
+    }
+    send_hsm_page();
+  });
+
+  server.on("/hsm/status", HTTP_GET, []() {
+    if (!is_authenticated_request()) {
+      server.send(401, "application/json", "{\"error\":\"auth\"}");
+      return;
+    }
+
+    String json;
+    if (!build_hsm_status_json(json)) {
+      server.send(500, "application/json", "{\"error\":\"hsm\"}");
+      return;
+    }
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/hsm/pin/unlock", HTTP_POST, []() {
+    if (!is_authenticated_request()) {
+      server.send(401, "text/plain", "Sign in required");
+      return;
+    }
+    if (!hsmPinConfigured) {
+      server.send(409, "text/plain", "HSM PIN is not configured");
+      return;
+    }
+    const String pin = server.arg("p");
+    if (!hsm_pin_unlock_with_pin(pin.c_str())) {
+      server.send(403, "text/plain", "Invalid PIN");
+      return;
+    }
+    server.send(200, "text/plain", "PIN unlocked");
+  });
+
+  server.on("/hsm/pin/set", HTTP_POST, []() {
+    if (!is_authenticated_request()) {
+      server.send(401, "text/plain", "Sign in required");
+      return;
+    }
+    if (!admin_unlocked()) {
+      server.send(403, "text/plain", "Admin actions locked (hold BOOT ~2-4s to unlock).");
+      return;
+    }
+    if (!hsm_presence_satisfied()) {
+      server.send(428, "text/plain", "Physical presence required (hold BOOT ~0.5-1.2s, then retry).");
+      return;
+    }
+
+    const String newPin = server.arg("n");
+    if (newPin.length() < HSM_PIN_MIN_LEN || newPin.length() > HSM_PIN_MAX_LEN) {
+      server.send(400, "text/plain", "PIN length invalid");
+      return;
+    }
+    if (hsmPinConfigured) {
+      const String oldPin = server.arg("p");
+      if (!hsm_pin_verify(oldPin.c_str())) {
+        server.send(403, "text/plain", "Current PIN invalid");
+        return;
+      }
+    }
+
+    if (!hsm_pin_set(newPin.c_str())) {
+      server.send(500, "text/plain", "Failed to set PIN");
+      return;
+    }
+    hsm_consume_presence();
+    server.send(200, "text/plain", "PIN saved");
+  });
+
+  server.on("/hsm/pin/clear", HTTP_POST, []() {
+    if (!is_authenticated_request()) {
+      server.send(401, "text/plain", "Sign in required");
+      return;
+    }
+    if (!admin_unlocked()) {
+      server.send(403, "text/plain", "Admin actions locked (hold BOOT ~2-4s to unlock).");
+      return;
+    }
+    if (!hsmPinConfigured) {
+      server.send(409, "text/plain", "HSM PIN is not configured");
+      return;
+    }
+    if (!hsm_presence_satisfied()) {
+      server.send(428, "text/plain", "Physical presence required (hold BOOT ~0.5-1.2s, then retry).");
+      return;
+    }
+    const String pin = server.arg("p");
+    if (!hsm_pin_verify(pin.c_str())) {
+      server.send(403, "text/plain", "Invalid PIN");
+      return;
+    }
+    hsm_pin_clear_prefs();
+    hsm_consume_presence();
+    server.send(200, "text/plain", "PIN cleared");
+  });
+
+  server.on("/hsm/generate", HTTP_POST, []() {
+    if (!is_authenticated_request()) {
+      server.send(401, "text/plain", "Sign in required");
+      return;
+    }
+    if (!admin_unlocked()) {
+      server.send(403, "text/plain", "Admin actions locked (hold BOOT ~2-4s to unlock).");
+      return;
+    }
+    if (!hsmPinConfigured) {
+      server.send(428, "text/plain", "Set an HSM PIN first");
+      return;
+    }
+    if (!hsm_pin_unlocked()) {
+      server.send(428, "text/plain", "PIN locked. Unlock PIN first.");
+      return;
+    }
+    if (!hsm_presence_satisfied()) {
+      server.send(428, "text/plain", "Physical presence required (hold BOOT ~0.5-1.2s, then retry).");
+      return;
+    }
+    if (!hsm_generate_and_store_key()) {
+      server.send(500, "text/plain", "HSM key generation failed");
+      return;
+    }
+    hsm_consume_presence();
+    server.send(200, "text/plain", "HSM key generated");
+  });
+
+  server.on("/hsm/delete", HTTP_POST, []() {
+    if (!is_authenticated_request()) {
+      server.send(401, "text/plain", "Sign in required");
+      return;
+    }
+    if (!admin_unlocked()) {
+      server.send(403, "text/plain", "Admin actions locked (hold BOOT ~2-4s to unlock).");
+      return;
+    }
+    if (!hsmPinConfigured) {
+      server.send(428, "text/plain", "Set an HSM PIN first");
+      return;
+    }
+    if (!hsm_pin_unlocked()) {
+      server.send(428, "text/plain", "PIN locked. Unlock PIN first.");
+      return;
+    }
+    if (!hsm_presence_satisfied()) {
+      server.send(428, "text/plain", "Physical presence required (hold BOOT ~0.5-1.2s, then retry).");
+      return;
+    }
+    if (!hsm_delete_key()) {
+      server.send(500, "text/plain", "HSM key delete failed");
+      return;
+    }
+    hsm_consume_presence();
+    server.send(200, "text/plain", "HSM key deleted");
+  });
+
+  server.on("/hsm/sign", HTTP_POST, []() {
+    if (!is_authenticated_request()) {
+      server.send(401, "text/plain", "Sign in required");
+      return;
+    }
+    if (!hsmState.loaded) {
+      server.send(409, "text/plain", "No HSM key loaded");
+      return;
+    }
+    if (!hsmPinConfigured) {
+      server.send(428, "text/plain", "Set an HSM PIN first");
+      return;
+    }
+    if (!hsm_pin_unlocked()) {
+      server.send(428, "text/plain", "PIN locked. Unlock PIN first.");
+      return;
+    }
+    if (!hsm_presence_satisfied()) {
+      server.send(428, "text/plain", "Physical presence required (hold BOOT ~0.5-1.2s, then retry).");
+      return;
+    }
+    if (!server.hasArg("m")) {
+      server.send(400, "text/plain", "Missing m");
+      return;
+    }
+
+    const String fmt = server.arg("fmt");
+    const String m = server.arg("m");
+    uint8_t digest[32] = {0};
+    size_t inputLen = 0;
+    if (!hsm_digest_from_form_input(fmt, m, digest, &inputLen)) {
+      server.send(400, "text/plain", "Invalid input. Use fmt=text|hex|digesthex.");
+      return;
+    }
+
+    uint8_t sig[HSM_SIGNATURE_DER_MAX] = {0};
+    size_t sigLen = 0;
+    if (!hsm_sign_digest_der(digest, sig, sizeof(sig), &sigLen)) {
+      secure_zero(digest, sizeof(digest));
+      secure_zero(sig, sizeof(sig));
+      server.send(429, "text/plain", "Sign failed or throttled");
+      return;
+    }
+
+    char digestHex[(32 * 2) + 1] = {0};
+    char sigHex[(HSM_SIGNATURE_DER_MAX * 2) + 1] = {0};
+    bytes_to_hex(digest, sizeof(digest), digestHex, sizeof(digestHex));
+    bytes_to_hex(sig, sigLen, sigHex, sizeof(sigHex));
+    secure_zero(digest, sizeof(digest));
+    secure_zero(sig, sizeof(sig));
+
+    String json;
+    json.reserve(320);
+    json += "{";
+    json += "\"ok\":true";
+    json += ",\"input_len\":";
+    json += String(inputLen);
+    json += ",\"digest_hex\":\"";
+    json += digestHex;
+    json += "\"";
+    json += ",\"signature_der_hex\":\"";
+    json += sigHex;
+    json += "\"";
+    json += ",\"sign_count\":";
+    json += String(hsmState.signCount);
+    json += "}";
+
+    hsm_consume_presence();
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/hsm/verify", HTTP_POST, []() {
+    if (!is_authenticated_request()) {
+      server.send(401, "text/plain", "Sign in required");
+      return;
+    }
+    if (!hsmState.loaded) {
+      server.send(409, "text/plain", "No HSM key loaded");
+      return;
+    }
+    if (!server.hasArg("m") || !server.hasArg("sig")) {
+      server.send(400, "text/plain", "Missing m or sig");
+      return;
+    }
+
+    const String fmt = server.arg("fmt");
+    const String m = server.arg("m");
+    const String sigHexIn = server.arg("sig");
+
+    uint8_t digest[32] = {0};
+    size_t inputLen = 0;
+    if (!hsm_digest_from_form_input(fmt, m, digest, &inputLen)) {
+      server.send(400, "text/plain", "Invalid input. Use fmt=text|hex|digesthex.");
+      return;
+    }
+
+    uint8_t sig[HSM_SIGNATURE_DER_MAX] = {0};
+    const size_t sigLen = hex_to_bytes(sigHexIn.c_str(), sig, sizeof(sig));
+    if (sigLen == 0) {
+      secure_zero(digest, sizeof(digest));
+      secure_zero(sig, sizeof(sig));
+      server.send(400, "text/plain", "Invalid signature hex");
+      return;
+    }
+
+    const bool valid = hsm_verify_digest_der(digest, sig, sigLen);
+    char digestHex[(32 * 2) + 1] = {0};
+    bytes_to_hex(digest, sizeof(digest), digestHex, sizeof(digestHex));
+    secure_zero(digest, sizeof(digest));
+    secure_zero(sig, sizeof(sig));
+
+    String json;
+    json.reserve(160);
+    json += "{";
+    json += "\"valid\":";
+    json += (valid ? "true" : "false");
+    json += ",\"input_len\":";
+    json += String(inputLen);
+    json += ",\"digest_hex\":\"";
+    json += digestHex;
+    json += "\"";
+    json += "}";
+
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json", json);
   });
 
   server.on("/keys/list", HTTP_GET, []() {
@@ -2380,6 +3924,10 @@ static void start_wifi_control() {
       server.send(401, "text/plain", "Sign in required");
       return;
     }
+    if (apManagementMode) {
+      server.send(403, "text/plain", "AP is in management-only mode");
+      return;
+    }
     if (!usb_kbm_hid_enabled()) {
       server.send(409, "text/plain", "USB keyboard/mouse HID disabled");
       return;
@@ -2399,6 +3947,10 @@ static void start_wifi_control() {
       server.send(401, "text/plain", "Sign in required");
       return;
     }
+    if (apManagementMode) {
+      server.send(403, "text/plain", "AP is in management-only mode");
+      return;
+    }
     if (!usb_kbm_hid_enabled()) {
       server.send(409, "text/plain", "USB keyboard/mouse HID disabled");
       return;
@@ -2413,6 +3965,10 @@ static void start_wifi_control() {
   server.on("/type", []() {
     if (!is_authenticated_request()) {
       server.send(401, "text/plain", "Sign in required");
+      return;
+    }
+    if (apManagementMode) {
+      server.send(403, "text/plain", "AP is in management-only mode");
       return;
     }
     if (!usb_kbm_hid_enabled()) {
@@ -2442,6 +3998,12 @@ static void poll_boot_button() {
   // Expire admin unlock window.
   if (!admin_unlocked()) {
     adminUnlockedUntil = 0;
+  }
+  if (!hsm_pin_unlocked()) {
+    hsmPinUnlockedUntil = 0;
+  }
+  if (!hsm_presence_satisfied()) {
+    hsmPresenceUntil = 0;
   }
 
   // While the authenticator is waiting for user presence, avoid interpreting BOOT presses as portal gestures.
@@ -2490,9 +4052,13 @@ static void poll_boot_button() {
       pendingSingleTapDue = now + TAP_GAP_MS;
     }
   } else {
+    if (held >= HSM_PRESENCE_HOLD_MIN_MS && held <= HSM_PRESENCE_HOLD_MAX_MS) {
+      hsm_mark_presence_now();
+      Serial.println("HSM/FIDO physical presence window opened.");
+    }
     if (held >= ADMIN_UNLOCK_HOLD_MIN_MS && held <= ADMIN_UNLOCK_HOLD_MAX_MS) {
       adminUnlockedUntil = now + ADMIN_UNLOCK_WINDOW_MS;
-      Serial.println("Admin actions unlocked (delete/backup/restore).");
+      Serial.println("Admin actions unlocked (keys + HSM).");
     }
     pendingSingleTap = false;
     tapCount = 0;
@@ -2534,6 +4100,13 @@ static void update_status_led() {
     return;
   }
 
+  // Physical-presence window (green blink).
+  if (hsm_presence_satisfied()) {
+    const bool on = ((now / 180U) % 2U) == 0U;
+    set_led_rgb(0, on ? 36 : 0, 0);
+    return;
+  }
+
   // Default indicator: Wi-Fi AP running (blue pulse every 2s).
   const uint32_t t = now % 2000U;
   const bool on = t < 120U;
@@ -2552,6 +4125,9 @@ void setup() {
   load_pair_token();
   load_totp_config();
   attestationProfile = load_attestation_profile();
+  apManagementMode = load_ap_management_mode();
+  (void)hsm_load_from_prefs();
+  (void)hsm_pin_load_from_prefs();
 
   USB.begin();
   usb_input_begin();

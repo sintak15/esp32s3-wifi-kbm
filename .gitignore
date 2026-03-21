@@ -4,6 +4,9 @@ out/
 *.bin
 *.elf
 *.map
+secrets/
+*.key
+*.pem
 
 # PlatformIO
 .pio/
@@ -14,4 +17,3 @@ out/
 .DS_Store
 Thumbs.db
 .vscode/
-

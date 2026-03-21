@@ -16,7 +16,7 @@
 // - Extensions and enterprise attestation
 
 #ifndef FIDO_DEBUG
-#define FIDO_DEBUG 1
+#define FIDO_DEBUG 0
 #endif
 
 #ifndef FIDO_FORCE_MAKECRED_EARLY_ERROR
@@ -136,9 +136,12 @@ static constexpr uint32_t CTAP_KEEPALIVE_EVERY_MS = 100;
 // - 1: require BOOT button for user presence (stronger local-presence semantics)
 // - 0: auto-approve UP after a short delay (easier interoperability testing)
 #ifndef FIDO_REQUIRE_BOOT_BUTTON_FOR_UP
-#define FIDO_REQUIRE_BOOT_BUTTON_FOR_UP 0
+#define FIDO_REQUIRE_BOOT_BUTTON_FOR_UP 1
 #endif
-static constexpr uint32_t CTAP_UP_AUTO_APPROVE_MS = 250;
+#if !FIDO_REQUIRE_BOOT_BUTTON_FOR_UP
+#error "Auto user-presence is disabled in this build; set FIDO_REQUIRE_BOOT_BUTTON_FOR_UP=1."
+#endif
+static constexpr uint32_t CTAP_UP_MIN_HOLD_MS = 250;
 
 static constexpr uint8_t CTAP_CRED_SECRET_VER = 1;
 static constexpr uint8_t CTAP_CRED_FLAG_RK = 0x01;
@@ -149,6 +152,27 @@ static const uint8_t CTAP_AAGUID[16] = {0x7a, 0x85, 0x2a, 0x5d, 0x77, 0x6a, 0x4a
 static uint32_t fidoAssignedCid = 0;
 static uint32_t fidoSignCount = 0;
 static bool fidoAwaitingUserPresence = false;
+
+// Shared security policy hooks implemented in esp32s3-wifi-kbm.ino.
+bool security_pin_configured();
+bool security_pin_unlocked_now();
+
+struct FidoDiagState {
+  uint32_t lastCid = 0;
+  uint8_t lastHidCmd = 0;
+  uint8_t lastCtapCmd = 0;
+  uint8_t lastCtapStatus = 0;
+  uint8_t lastHidError = 0;
+  uint32_t totalCtapRequests = 0;
+  uint32_t totalCtapOk = 0;
+  uint32_t totalCtapErr = 0;
+  uint32_t totalPinGateBlocks = 0;
+  uint32_t totalUpSatisfied = 0;
+  uint32_t lastRxMs = 0;
+  uint32_t lastTxMs = 0;
+};
+
+static FidoDiagState fidoDiag;
 
 static const char* ctaphid_cmd_name(const uint8_t cmd) {
   switch (cmd) {
@@ -503,17 +527,25 @@ static bool runtime_cred_lookup_by_rpid(const char* rpId, uint8_t* idOut, const 
   if (!rpId || rpId[0] == '\0' || !idOut || !idLenOut || !secretOut || !secretLenOut) return false;
   if (idOutMax < CRED_MAX_ID_LEN || secretOutMax < CRED_MAX_SECRET_LEN) return false;
 
+  int bestIdx = -1;
+  uint32_t bestStamp = 0;
   for (size_t i = 0; i < RUNTIME_CRED_SLOTS; ++i) {
     const RuntimeCredRecord& rec = runtimeCreds[i];
     if (!rec.used) continue;
     if (strcmp(rec.rpId, rpId) != 0) continue;
-    memcpy(idOut, rec.id, rec.idLen);
-    *idLenOut = rec.idLen;
-    memcpy(secretOut, rec.secret, rec.secretLen);
-    *secretLenOut = rec.secretLen;
-    return true;
+    if (bestIdx < 0 || rec.stamp >= bestStamp) {
+      bestIdx = static_cast<int>(i);
+      bestStamp = rec.stamp;
+    }
   }
-  return false;
+  if (bestIdx < 0) return false;
+
+  const RuntimeCredRecord& rec = runtimeCreds[bestIdx];
+  memcpy(idOut, rec.id, rec.idLen);
+  *idLenOut = rec.idLen;
+  memcpy(secretOut, rec.secret, rec.secretLen);
+  *secretLenOut = rec.secretLen;
+  return true;
 }
 
 static bool cred_store_id_exists(const uint8_t* id, const size_t idLen) {
@@ -1470,6 +1502,8 @@ struct PendingCtap {
   uint8_t data[FIDO_MAX_PAYLOAD];
   uint32_t startedMs = 0;
   uint32_t lastKeepaliveMs = 0;
+  bool sawButtonRelease = false;
+  uint32_t buttonDownSinceMs = 0;
 };
 
 static PendingCtap pendingCtap;
@@ -1697,6 +1731,9 @@ static void fido_send_response(const uint32_t cid, const uint8_t cmd, const uint
 }
 
 static void fido_send_error(const uint32_t cid, const uint8_t err) {
+  fidoDiag.lastCid = cid;
+  fidoDiag.lastHidError = err;
+  fidoDiag.lastTxMs = millis();
   FIDO_LOG("TX ERROR cid=%08lX err=%s(0x%02X)", static_cast<unsigned long>(cid), ctaphid_err_name(err), err);
   fido_send_response(cid, CTAPHID_CMD_ERROR, &err, 1);
 }
@@ -1706,6 +1743,14 @@ static void fido_send_keepalive(const uint32_t cid, const uint8_t status) {
 }
 
 static void fido_send_ctap2_status(const uint32_t cid, const uint8_t status, const uint8_t* cbor, const size_t cborLen) {
+  fidoDiag.lastCid = cid;
+  fidoDiag.lastCtapStatus = status;
+  fidoDiag.lastTxMs = millis();
+  if (status == CTAP2_OK) {
+    fidoDiag.totalCtapOk++;
+  } else {
+    fidoDiag.totalCtapErr++;
+  }
   FIDO_LOG("TX CTAP2 cid=%08lX status=%s(0x%02X) cborLen=%u", static_cast<unsigned long>(cid), ctap2_status_name(status), status,
            static_cast<unsigned>(cborLen));
   uint8_t buf[1 + 512];
@@ -1727,6 +1772,8 @@ static void fido_hid_on_packet(const uint8_t* buffer, const uint16_t lenBytes) {
   const uint32_t cid = read_be_u32(buffer + 0);
   const uint8_t b4 = buffer[4];
   const uint32_t now = millis();
+  fidoDiag.lastCid = cid;
+  fidoDiag.lastRxMs = now;
 
   // If a complete request is waiting, report busy.
   if (fidoReq.ready) {
@@ -1737,6 +1784,7 @@ static void fido_hid_on_packet(const uint8_t* buffer, const uint16_t lenBytes) {
   if (b4 & 0x80) {
     // Initial packet
     const uint8_t cmd = static_cast<uint8_t>(b4 & 0x7F);
+    fidoDiag.lastHidCmd = cmd;
     const uint16_t total = static_cast<uint16_t>((static_cast<uint16_t>(buffer[5]) << 8) | buffer[6]);
     FIDO_LOG("RX init cid=%08lX cmd=%s(0x%02X) total=%u", static_cast<unsigned long>(cid), ctaphid_cmd_name(cmd), cmd,
              static_cast<unsigned>(total));
@@ -1852,14 +1900,10 @@ static void fido_start_pending(const uint32_t cid, const uint8_t ctapCmd, const 
   if (len && data) memcpy(pendingCtap.data, data, len);
   pendingCtap.startedMs = millis();
   pendingCtap.lastKeepaliveMs = pendingCtap.startedMs;
+  pendingCtap.sawButtonRelease = !boot_button_down();
+  pendingCtap.buttonDownSinceMs = boot_button_down() ? pendingCtap.startedMs : 0;
   fidoAwaitingUserPresence = true;
-#if FIDO_REQUIRE_BOOT_BUTTON_FOR_UP
   fido_send_keepalive(cid, CTAPHID_KEEPALIVE_STATUS_UP_NEEDED);
-#else
-  // Queue an immediate keepalive so host GetFeature does not read an empty frame
-  // while this request is still pending.
-  fido_send_keepalive(cid, CTAPHID_KEEPALIVE_STATUS_PROCESSING);
-#endif
   FIDO_LOG("Pending start cid=%08lX cmd=%s(0x%02X) len=%u", static_cast<unsigned long>(cid), ctap_cmd_name(ctapCmd), ctapCmd,
            static_cast<unsigned>(len));
 }
@@ -1886,6 +1930,10 @@ static void fido_handle_cbor(const uint32_t cid, const uint8_t* data, const size
   const uint8_t ctapCmd = data[0];
   const uint8_t* payload = data + 1;
   const size_t payloadLen = len - 1;
+  fidoDiag.lastCid = cid;
+  fidoDiag.lastCtapCmd = ctapCmd;
+  fidoDiag.totalCtapRequests++;
+  fidoDiag.lastRxMs = millis();
   FIDO_LOG("RX CTAP2 cid=%08lX cmd=%s(0x%02X) payloadLen=%u", static_cast<unsigned long>(cid), ctap_cmd_name(ctapCmd), ctapCmd,
            static_cast<unsigned>(payloadLen));
 
@@ -1907,6 +1955,16 @@ static void fido_handle_cbor(const uint32_t cid, const uint8_t* data, const size
     return;
   }
 
+  if (ctapCmd == CTAP_CMD_MAKE_CREDENTIAL || ctapCmd == CTAP_CMD_GET_ASSERTION || ctapCmd == CTAP_CMD_RESET) {
+    // Enforce PIN only when the device PIN is configured.
+    if (security_pin_configured() && !security_pin_unlocked_now()) {
+      fidoDiag.totalPinGateBlocks++;
+      FIDO_LOG("Security PIN gate blocked cmd=%s", ctap_cmd_name(ctapCmd));
+      fido_send_ctap2_status(cid, CTAP2_ERR_PIN_REQUIRED, nullptr, 0);
+      return;
+    }
+  }
+
   if (ctapCmd == CTAP_CMD_MAKE_CREDENTIAL) {
 #if FIDO_FORCE_DIRECT_MAKECRED_ERROR
     // Isolation mode: prove large request reassembly + immediate CBOR response path.
@@ -1914,28 +1972,6 @@ static void fido_handle_cbor(const uint32_t cid, const uint8_t* data, const size
     return;
 #endif
   }
-
-#if !FIDO_REQUIRE_BOOT_BUTTON_FOR_UP
-  // Auto-approve mode: execute request immediately to avoid host-side feature-poll
-  // timing races while waiting on a pending operation.
-  if (ctapCmd == CTAP_CMD_MAKE_CREDENTIAL || ctapCmd == CTAP_CMD_GET_ASSERTION || ctapCmd == CTAP_CMD_RESET) {
-    uint8_t body[512];
-    size_t bodyLen = 0;
-    uint8_t st = CTAP1_ERR_OTHER;
-    activeCtap.cid = cid;
-    activeCtap.active = true;
-    if (ctapCmd == CTAP_CMD_MAKE_CREDENTIAL) {
-      st = ctap2_make_credential(payload, payloadLen, body, sizeof(body), &bodyLen);
-    } else if (ctapCmd == CTAP_CMD_GET_ASSERTION) {
-      st = ctap2_get_assertion(payload, payloadLen, body, sizeof(body), &bodyLen);
-    } else {
-      st = ctap2_reset();
-    }
-    activeCtap.active = false;
-    fido_send_ctap2_status(cid, st, body, bodyLen);
-    return;
-  }
-#endif
 
   if (ctapCmd == CTAP_CMD_MAKE_CREDENTIAL || ctapCmd == CTAP_CMD_GET_ASSERTION || ctapCmd == CTAP_CMD_RESET) {
     fido_start_pending(cid, ctapCmd, payload, payloadLen);
@@ -1983,7 +2019,6 @@ static void fido_tick_pending() {
   const uint32_t cid = pendingCtap.cid;
   bool upSatisfied = false;
 
-#if FIDO_REQUIRE_BOOT_BUTTON_FOR_UP
   if (static_cast<int32_t>(now - pendingCtap.startedMs) > static_cast<int32_t>(CTAP_UP_TIMEOUT_MS)) {
     pendingCtap.active = false;
     fidoAwaitingUserPresence = false;
@@ -1997,15 +2032,25 @@ static void fido_tick_pending() {
     fido_send_keepalive(cid, CTAPHID_KEEPALIVE_STATUS_UP_NEEDED);
   }
 
-  upSatisfied = boot_button_down();
-#else
-  if (static_cast<int32_t>(now - pendingCtap.lastKeepaliveMs) >= static_cast<int32_t>(CTAP_KEEPALIVE_EVERY_MS)) {
-    pendingCtap.lastKeepaliveMs = now;
-    fido_send_keepalive(cid, CTAPHID_KEEPALIVE_STATUS_PROCESSING);
+  const bool down = boot_button_down();
+  if (!pendingCtap.sawButtonRelease) {
+    // Require at least one release edge after request start so a stuck-low line
+    // cannot satisfy user presence immediately.
+    if (!down) {
+      pendingCtap.sawButtonRelease = true;
+      pendingCtap.buttonDownSinceMs = 0;
+    }
+    return;
   }
-  upSatisfied = static_cast<int32_t>(now - pendingCtap.startedMs) >= static_cast<int32_t>(CTAP_UP_AUTO_APPROVE_MS);
-#endif
+
+  if (down) {
+    if (pendingCtap.buttonDownSinceMs == 0) pendingCtap.buttonDownSinceMs = now;
+    upSatisfied = static_cast<int32_t>(now - pendingCtap.buttonDownSinceMs) >= static_cast<int32_t>(CTAP_UP_MIN_HOLD_MS);
+  } else {
+    pendingCtap.buttonDownSinceMs = 0;
+  }
   if (!upSatisfied) return;
+  fidoDiag.totalUpSatisfied++;
   FIDO_LOG("User presence satisfied cid=%08lX", static_cast<unsigned long>(cid));
 
   uint8_t body[512];
@@ -2040,6 +2085,7 @@ void fido_begin() {
   activeCtap.cid = 0;
   fidoAwaitingUserPresence = false;
   fidoHid.clearQueue();
+  fido_diag_clear();
   runtime_cred_clear();
   fidoSignCount = load_sign_count();
   FIDO_LOG("FIDO init signCount=%lu debug=%u", static_cast<unsigned long>(fidoSignCount), static_cast<unsigned>(FIDO_DEBUG));
@@ -2047,6 +2093,59 @@ void fido_begin() {
 
 bool fido_waiting_for_user_presence() {
   return pendingCtap.active;
+}
+
+void fido_diag_clear() {
+  memset(&fidoDiag, 0, sizeof(fidoDiag));
+}
+
+void fido_diag_build_json(String& outJson) {
+  const uint32_t now = millis();
+  const uint32_t rxAgo = (fidoDiag.lastRxMs == 0) ? 0 : static_cast<uint32_t>(now - fidoDiag.lastRxMs);
+  const uint32_t txAgo = (fidoDiag.lastTxMs == 0) ? 0 : static_cast<uint32_t>(now - fidoDiag.lastTxMs);
+
+  outJson = "";
+  outJson.reserve(720);
+  outJson += "{";
+  outJson += "\"last_cid\":";
+  outJson += String(fidoDiag.lastCid);
+  outJson += ",\"last_hid_cmd\":";
+  outJson += String(fidoDiag.lastHidCmd);
+  outJson += ",\"last_hid_cmd_name\":\"";
+  outJson += ctaphid_cmd_name(fidoDiag.lastHidCmd);
+  outJson += "\"";
+  outJson += ",\"last_ctap_cmd\":";
+  outJson += String(fidoDiag.lastCtapCmd);
+  outJson += ",\"last_ctap_cmd_name\":\"";
+  outJson += ctap_cmd_name(fidoDiag.lastCtapCmd);
+  outJson += "\"";
+  outJson += ",\"last_ctap_status\":";
+  outJson += String(fidoDiag.lastCtapStatus);
+  outJson += ",\"last_ctap_status_name\":\"";
+  outJson += ctap2_status_name(fidoDiag.lastCtapStatus);
+  outJson += "\"";
+  outJson += ",\"last_hid_error\":";
+  outJson += String(fidoDiag.lastHidError);
+  outJson += ",\"last_hid_error_name\":\"";
+  outJson += ctaphid_err_name(fidoDiag.lastHidError);
+  outJson += "\"";
+  outJson += ",\"pending_waiting_up\":";
+  outJson += (pendingCtap.active ? "true" : "false");
+  outJson += ",\"rx_ms_ago\":";
+  outJson += String(rxAgo);
+  outJson += ",\"tx_ms_ago\":";
+  outJson += String(txAgo);
+  outJson += ",\"ctap_requests_total\":";
+  outJson += String(fidoDiag.totalCtapRequests);
+  outJson += ",\"ctap_ok_total\":";
+  outJson += String(fidoDiag.totalCtapOk);
+  outJson += ",\"ctap_err_total\":";
+  outJson += String(fidoDiag.totalCtapErr);
+  outJson += ",\"pin_gate_blocks_total\":";
+  outJson += String(fidoDiag.totalPinGateBlocks);
+  outJson += ",\"up_satisfied_total\":";
+  outJson += String(fidoDiag.totalUpSatisfied);
+  outJson += "}";
 }
 
 void fido_task() {
