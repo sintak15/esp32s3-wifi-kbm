@@ -1,0 +1,1485 @@
+﻿diff --git a/esp32s3-wifi-kbm.ino b/esp32s3-wifi-kbm.ino
+index 6747da3..9ed7d79 100644
+--- a/esp32s3-wifi-kbm.ino
++++ b/esp32s3-wifi-kbm.ino
+@@ -19,6 +19,23 @@
+ #include "USBHIDMouse.h"
+ #include <cbor.h>
+ 
++// FIDO2 CBOR parsing + crypto can be stack-heavy on ESP32-S3.
++SET_LOOP_TASK_STACK_SIZE(16 * 1024);  // 16KB loop task stack
++
++// Stability mode for WebAuthn troubleshooting:
++// - 1: disable Wi-Fi portal runtime so USB/FIDO gets all CPU+power budget
++// - 0: run normal Wi-Fi portal + FIDO
++#ifndef FIDO_STABILITY_MODE
++#define FIDO_STABILITY_MODE 1
++#endif
++
++// USB mode switch:
++// - 0 = FIDO-only HID (recommended for current Windows CTAP troubleshooting)
++// - 1 = Composite HID keyboard + mouse + FIDO
++#ifndef USB_ENABLE_KBM_HID
++#define USB_ENABLE_KBM_HID 0
++#endif
++
+ // Wi-Fi credentials for the ESP32-S3 access point
+ // Recommendation: change these before use.
+ static constexpr const char* AP_SSID = "ESP32-SuperMini";
+@@ -80,8 +97,16 @@ static constexpr bool MODE_LED_IS_RGB = false;
+ DNSServer dnsServer;
+ WebServer server(HTTP_PORT);
+ 
++// Force TinyUSB HID interface protocol to "none" so the composite HID descriptor
++// can be recognized for FIDO usage in desktop WebAuthn flows.
++// Without this, keyboard-first initialization may advertise boot-keyboard protocol
++// and some hosts won't surface it as a security key transport.
++USBHID _hidInterfaceMode(HID_ITF_PROTOCOL_NONE);
++
++#if USB_ENABLE_KBM_HID
+ USBHIDKeyboard Keyboard;
+ USBHIDMouse Mouse;
++#endif
+ 
+ enum class AttestationProfile : uint8_t {
+   Diy = 0,
+@@ -127,6 +152,55 @@ void fido_begin();
+ void fido_task();
+ bool fido_waiting_for_user_presence();
+ 
++static bool usb_kbm_hid_enabled() {
++  return USB_ENABLE_KBM_HID != 0;
++}
++
++static void usb_input_begin() {
++#if USB_ENABLE_KBM_HID
++  Keyboard.begin();
++  Mouse.begin();
++#endif
++}
++
++static bool usb_type_text(const String& text) {
++#if USB_ENABLE_KBM_HID
++  Keyboard.print(text);
++  return true;
++#else
++  (void)text;
++  return false;
++#endif
++}
++
++static bool usb_mouse_move(const int x, const int y) {
++#if USB_ENABLE_KBM_HID
++  Mouse.move(static_cast<int8_t>(x), static_cast<int8_t>(y));
++  return true;
++#else
++  (void)x;
++  (void)y;
++  return false;
++#endif
++}
++
++static bool usb_mouse_click(const String& btn) {
++#if USB_ENABLE_KBM_HID
++  if (btn == "left") {
++    Mouse.click(MOUSE_LEFT);
++    return true;
++  }
++  if (btn == "right") {
++    Mouse.click(MOUSE_RIGHT);
++    return true;
++  }
++  return false;
++#else
++  (void)btn;
++  return false;
++#endif
++}
++
+ // --- HTML & JAVASCRIPT FOR THE WEB UI ---
+ static const char index_html[] PROGMEM = R"rawliteral(
+ <!DOCTYPE html>
+@@ -1954,8 +2028,13 @@ static void handle_single_tap_action() {
+     Serial.println("Single tap: TOTP not ready (secret/time).");
+     return;
+   }
+-  Keyboard.print(code);
+-  if (totpAppendEnter) Keyboard.print("\n");
++  if (!usb_type_text(String(code))) {
++    Serial.println("Single tap: USB keyboard HID disabled (FIDO-only mode).");
++    return;
++  }
++  if (totpAppendEnter) {
++    (void)usb_type_text("\n");
++  }
+ }
+ 
+ static void start_wifi_control() {
+@@ -2301,12 +2380,16 @@ static void start_wifi_control() {
+       server.send(401, "text/plain", "Sign in required");
+       return;
+     }
++    if (!usb_kbm_hid_enabled()) {
++      server.send(409, "text/plain", "USB keyboard/mouse HID disabled");
++      return;
++    }
+     if (server.hasArg("x") && server.hasArg("y")) {
+       int x = server.arg("x").toInt();
+       int y = server.arg("y").toInt();
+       x = constrain(x, -127, 127);
+       y = constrain(y, -127, 127);
+-      Mouse.move(x, y);
++      (void)usb_mouse_move(x, y);
+     }
+     send_ok_minimal();
+   });
+@@ -2316,10 +2399,13 @@ static void start_wifi_control() {
+       server.send(401, "text/plain", "Sign in required");
+       return;
+     }
++    if (!usb_kbm_hid_enabled()) {
++      server.send(409, "text/plain", "USB keyboard/mouse HID disabled");
++      return;
++    }
+     if (server.hasArg("b")) {
+       const String btn = server.arg("b");
+-      if (btn == "left") Mouse.click(MOUSE_LEFT);
+-      else if (btn == "right") Mouse.click(MOUSE_RIGHT);
++      (void)usb_mouse_click(btn);
+     }
+     send_ok_minimal();
+   });
+@@ -2329,10 +2415,14 @@ static void start_wifi_control() {
+       server.send(401, "text/plain", "Sign in required");
+       return;
+     }
++    if (!usb_kbm_hid_enabled()) {
++      server.send(409, "text/plain", "USB keyboard/mouse HID disabled");
++      return;
++    }
+     if (server.hasArg("t")) {
+       String text = server.arg("t");
+       if (text.length() > 256) text.remove(256);
+-      Keyboard.print(text);
++      (void)usb_type_text(text);
+     }
+     send_ok_minimal();
+   });
+@@ -2455,18 +2545,27 @@ void setup() {
+   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+   init_led();
+ 
++  // FIDO makeCredential/getAssertion can spend noticeable time in ECC operations.
++  // Prevent loop-task watchdog resets from dropping USB during those operations.
++  disableLoopWDT();
++
+   load_pair_token();
+   load_totp_config();
+   attestationProfile = load_attestation_profile();
+ 
+   USB.begin();
+-  Keyboard.begin();
+-  Mouse.begin();
++  usb_input_begin();
+   fido_begin();
+ 
+   Serial.println("Triple-tap BOOT to enable portal pairing.");
+ 
++#if FIDO_STABILITY_MODE
++  // Disable radio during FIDO transport troubleshooting to minimize USB dropouts.
++  WiFi.mode(WIFI_OFF);
++  WiFi.setSleep(false);
++#else
+   start_wifi_control();
++#endif
+ }
+ 
+ void loop() {
+@@ -2474,8 +2573,10 @@ void loop() {
+   poll_boot_button();
+   update_status_led();
+ 
++#if !FIDO_STABILITY_MODE
+   dnsServer.processNextRequest();
+   server.handleClient();
++#endif
+ 
+   delay(1); // yield to WiFi/USB stacks
+ }
+diff --git a/fido2_ctap2.ino b/fido2_ctap2.ino
+index 5868bbe..dcf9197 100644
+--- a/fido2_ctap2.ino
++++ b/fido2_ctap2.ino
+@@ -16,10 +16,62 @@
+ // - Extensions and enterprise attestation
+ 
+ #ifndef FIDO_DEBUG
+-#define FIDO_DEBUG 0
++#define FIDO_DEBUG 1
++#endif
++
++#ifndef FIDO_FORCE_MAKECRED_EARLY_ERROR
++#define FIDO_FORCE_MAKECRED_EARLY_ERROR 0
++#endif
++
++#ifndef FIDO_FORCE_MAKECRED_PARSE_ONLY_ERROR
++#define FIDO_FORCE_MAKECRED_PARSE_ONLY_ERROR 0
++#endif
++
++#ifndef FIDO_FORCE_DIRECT_MAKECRED_ERROR
++#define FIDO_FORCE_DIRECT_MAKECRED_ERROR 0
++#endif
++
++// Debug stage checkpoints for makeCredential:
++// 0 = normal flow
++// 1 = return error after successful parse
++// 2 = return error after key generation
++// 3 = return error after credential store write
++// 4 = return error after attestation/signing
++#ifndef FIDO_MAKECRED_TEST_STAGE
++#define FIDO_MAKECRED_TEST_STAGE 0
++#endif
++
++// Temporary troubleshooting switch:
++// - 1: use a fixed P-256 test keypair (private = 1, public = generator point)
++// - 0: generate a random keypair with mbedTLS
++#ifndef FIDO_USE_STATIC_TEST_KEYPAIR
++#define FIDO_USE_STATIC_TEST_KEYPAIR 0
++#endif
++
++// Writing credentials/sign counters to NVS can stall long enough to destabilize
++// CTAP HID on some ESP32-S3 setups. Keep FIDO state in RAM for reliability.
++#ifndef FIDO_DISABLE_PERSISTENCE
++#define FIDO_DISABLE_PERSISTENCE 1
++#endif
++
++#ifndef FIDO_STABILITY_SKIP_CRED_DESCRIPTOR_PARSE
++#define FIDO_STABILITY_SKIP_CRED_DESCRIPTOR_PARSE 1
++#endif
++
++#ifndef FIDO_STABILITY_MINIMAL_MAKECRED_PARSE
++#define FIDO_STABILITY_MINIMAL_MAKECRED_PARSE 1
++#endif
++
++#ifndef USB_ENABLE_KBM_HID
++#define USB_ENABLE_KBM_HID 0
+ #endif
+ 
+ static constexpr size_t   FIDO_HID_PACKET_SIZE = 64;
++#if USB_ENABLE_KBM_HID
++static constexpr uint8_t  FIDO_HID_REPORT_ID = HID_REPORT_ID_VENDOR;
++#else
++static constexpr uint8_t  FIDO_HID_REPORT_ID = HID_REPORT_ID_NONE;
++#endif
+ static constexpr uint32_t CTAPHID_BROADCAST_CID = 0xFFFFFFFFUL;
+ 
+ static constexpr uint8_t CTAPHID_CMD_PING = 0x01;
+@@ -80,6 +132,14 @@ static constexpr size_t FIDO_MAX_PAYLOAD = 1024;
+ static constexpr uint32_t CTAP_UP_TIMEOUT_MS = 30 * 1000;
+ static constexpr uint32_t CTAP_KEEPALIVE_EVERY_MS = 100;
+ 
++// Development toggle:
++// - 1: require BOOT button for user presence (stronger local-presence semantics)
++// - 0: auto-approve UP after a short delay (easier interoperability testing)
++#ifndef FIDO_REQUIRE_BOOT_BUTTON_FOR_UP
++#define FIDO_REQUIRE_BOOT_BUTTON_FOR_UP 0
++#endif
++static constexpr uint32_t CTAP_UP_AUTO_APPROVE_MS = 250;
++
+ static constexpr uint8_t CTAP_CRED_SECRET_VER = 1;
+ static constexpr uint8_t CTAP_CRED_FLAG_RK = 0x01;
+ 
+@@ -201,6 +261,21 @@ struct EcKeyPair {
+ 
+ static bool ec_generate(EcKeyPair* out) {
+   if (!out) return false;
++#if FIDO_USE_STATIC_TEST_KEYPAIR
++  static const uint8_t kPriv[32] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++                                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++                                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01};
++  static const uint8_t kX[32] = {0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6,
++                                 0xe5, 0x63, 0xa4, 0x40, 0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb,
++                                 0x33, 0xa0, 0xf4, 0xa1, 0x39, 0x45, 0xd8, 0x98, 0xc2, 0x96};
++  static const uint8_t kY[32] = {0x4f, 0xe3, 0x42, 0xe2, 0xfe, 0x1a, 0x7f, 0x9b, 0x8e, 0xe7, 0xeb,
++                                 0x4a, 0x7c, 0x0f, 0x9e, 0x16, 0x2c, 0xbc, 0xe3, 0x35, 0x76, 0xb3,
++                                 0x15, 0xec, 0xec, 0xbb, 0x64, 0x06, 0x83, 0x7b, 0xf5, 0x1f};
++  memcpy(out->priv, kPriv, sizeof(out->priv));
++  memcpy(out->x, kX, sizeof(out->x));
++  memcpy(out->y, kY, sizeof(out->y));
++  return true;
++#else
+   mbedtls_ecp_keypair key;
+   mbedtls_ecp_keypair_init(&key);
+   const int rc = mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, &key, mbedtls_rng, nullptr);
+@@ -222,6 +297,7 @@ static bool ec_generate(EcKeyPair* out) {
+   }
+   mbedtls_ecp_keypair_free(&key);
+   return (rc1 == 0) && (privLen == sizeof(out->priv)) && (rc2 == 0) && (rc3 == 0);
++#endif
+ }
+ 
+ static bool ec_sign_der(const uint8_t priv[32], const uint8_t hash[32], uint8_t* sigOut, const size_t sigOutMax, size_t* sigLenOut) {
+@@ -290,22 +366,165 @@ static bool parse_cred_secret(const uint8_t* secret, const size_t secretLen, boo
+ }
+ 
+ static uint32_t load_sign_count() {
++#if FIDO_DISABLE_PERSISTENCE
++  return 0;
++#else
+   prefs.begin("kbm", true);
+   const uint32_t v = prefs.getUInt("sc", 0);
+   prefs.end();
+   return v;
++#endif
+ }
+ 
+ static void save_sign_count(const uint32_t v) {
++#if FIDO_DISABLE_PERSISTENCE
++  (void)v;
++#else
+   prefs.begin("kbm", false);
+   prefs.putUInt("sc", v);
+   prefs.end();
++#endif
++}
++
++static constexpr size_t RUNTIME_CRED_SLOTS = 8;
++struct RuntimeCredRecord {
++  bool used = false;
++  char rpId[CRED_MAX_RPID_LEN + 1] = {0};
++  uint8_t id[CRED_MAX_ID_LEN] = {0};
++  uint16_t idLen = 0;
++  uint8_t secret[CRED_MAX_SECRET_LEN] = {0};
++  uint16_t secretLen = 0;
++  uint32_t stamp = 0;
++};
++
++static RuntimeCredRecord runtimeCreds[RUNTIME_CRED_SLOTS];
++static uint32_t runtimeCredStamp = 1;
++
++static int runtime_cred_find(const uint8_t* id, const size_t idLen) {
++  if (!id || idLen == 0 || idLen > CRED_MAX_ID_LEN) return -1;
++  for (size_t i = 0; i < RUNTIME_CRED_SLOTS; ++i) {
++    const RuntimeCredRecord& rec = runtimeCreds[i];
++    if (!rec.used) continue;
++    if (rec.idLen != idLen) continue;
++    if (memcmp(rec.id, id, idLen) == 0) return static_cast<int>(i);
++  }
++  return -1;
++}
++
++static void runtime_cred_clear() {
++  for (size_t i = 0; i < RUNTIME_CRED_SLOTS; ++i) {
++    RuntimeCredRecord& rec = runtimeCreds[i];
++    if (rec.used && rec.secretLen > 0) secure_zero(rec.secret, rec.secretLen);
++    rec.used = false;
++    rec.rpId[0] = '\0';
++    rec.idLen = 0;
++    rec.secretLen = 0;
++    rec.stamp = 0;
++  }
++  runtimeCredStamp = 1;
++}
++
++static bool runtime_cred_exists(const uint8_t* id, const size_t idLen) {
++  return runtime_cred_find(id, idLen) >= 0;
++}
++
++static bool runtime_cred_add(const char* rpId, const uint8_t* id, const size_t idLen, const uint8_t* secret, const size_t secretLen) {
++  if (!rpId || rpId[0] == '\0' || !id || idLen == 0 || idLen > CRED_MAX_ID_LEN || !secret || secretLen == 0 ||
++      secretLen > CRED_MAX_SECRET_LEN) {
++    return false;
++  }
++
++  int idx = runtime_cred_find(id, idLen);
++  if (idx < 0) {
++    for (size_t i = 0; i < RUNTIME_CRED_SLOTS; ++i) {
++      if (!runtimeCreds[i].used) {
++        idx = static_cast<int>(i);
++        break;
++      }
++    }
++  }
++  if (idx < 0) {
++    uint32_t oldest = UINT32_MAX;
++    size_t oldestIdx = 0;
++    for (size_t i = 0; i < RUNTIME_CRED_SLOTS; ++i) {
++      if (runtimeCreds[i].stamp < oldest) {
++        oldest = runtimeCreds[i].stamp;
++        oldestIdx = i;
++      }
++    }
++    idx = static_cast<int>(oldestIdx);
++  }
++
++  RuntimeCredRecord& rec = runtimeCreds[idx];
++  if (rec.used && rec.secretLen > 0) secure_zero(rec.secret, rec.secretLen);
++  rec.used = true;
++
++  const size_t rpLen = strnlen(rpId, CRED_MAX_RPID_LEN);
++  memcpy(rec.rpId, rpId, rpLen);
++  rec.rpId[rpLen] = '\0';
++
++  rec.idLen = static_cast<uint16_t>(idLen);
++  memcpy(rec.id, id, idLen);
++
++  rec.secretLen = static_cast<uint16_t>(secretLen);
++  memcpy(rec.secret, secret, secretLen);
++
++  rec.stamp = runtimeCredStamp++;
++  if (runtimeCredStamp == 0) runtimeCredStamp = 1;
++  return true;
++}
++
++static bool runtime_cred_lookup(const uint8_t* id, const size_t idLen, char* rpOut, const size_t rpOutMax, uint8_t* secretOut,
++                                size_t* secretLenOut) {
++  if (secretLenOut) *secretLenOut = 0;
++  if (rpOut && rpOutMax) rpOut[0] = '\0';
++
++  const int idx = runtime_cred_find(id, idLen);
++  if (idx < 0) return false;
++  const RuntimeCredRecord& rec = runtimeCreds[idx];
++
++  if (rpOut && rpOutMax) {
++    const size_t rpLen = strnlen(rec.rpId, CRED_MAX_RPID_LEN);
++    const size_t copyLen = (rpLen < (rpOutMax - 1)) ? rpLen : (rpOutMax - 1);
++    memcpy(rpOut, rec.rpId, copyLen);
++    rpOut[copyLen] = '\0';
++  }
++  if (secretOut && secretLenOut) {
++    memcpy(secretOut, rec.secret, rec.secretLen);
++    *secretLenOut = rec.secretLen;
++  }
++  return true;
++}
++
++static bool runtime_cred_lookup_by_rpid(const char* rpId, uint8_t* idOut, const size_t idOutMax, size_t* idLenOut, uint8_t* secretOut,
++                                        const size_t secretOutMax, size_t* secretLenOut) {
++  if (idLenOut) *idLenOut = 0;
++  if (secretLenOut) *secretLenOut = 0;
++  if (!rpId || rpId[0] == '\0' || !idOut || !idLenOut || !secretOut || !secretLenOut) return false;
++  if (idOutMax < CRED_MAX_ID_LEN || secretOutMax < CRED_MAX_SECRET_LEN) return false;
++
++  for (size_t i = 0; i < RUNTIME_CRED_SLOTS; ++i) {
++    const RuntimeCredRecord& rec = runtimeCreds[i];
++    if (!rec.used) continue;
++    if (strcmp(rec.rpId, rpId) != 0) continue;
++    memcpy(idOut, rec.id, rec.idLen);
++    *idLenOut = rec.idLen;
++    memcpy(secretOut, rec.secret, rec.secretLen);
++    *secretLenOut = rec.secretLen;
++    return true;
++  }
++  return false;
+ }
+ 
+ static bool cred_store_id_exists(const uint8_t* id, const size_t idLen) {
+   static constexpr size_t kStoreHdrLen = 12;
+   static constexpr size_t kRecHdrLen = 12;
+   if (!id || idLen == 0 || idLen > CRED_MAX_ID_LEN) return false;
++  if (runtime_cred_exists(id, idLen)) return true;
++
++#if FIDO_DISABLE_PERSISTENCE
++  return false;
++#endif
+ 
+   uint8_t* buf = nullptr;
+   size_t len = 0;
+@@ -349,6 +568,12 @@ static bool cred_store_add_credential(const char* rpId, const uint8_t* id, const
+   }
+   const size_t rpLen = strnlen(rpId, CRED_MAX_RPID_LEN + 1);
+   if (rpLen == 0 || rpLen > CRED_MAX_RPID_LEN) return false;
++  if (runtime_cred_exists(id, idLen)) return false;
++  if (!runtime_cred_add(rpId, id, idLen, secret, secretLen)) return false;
++
++#if FIDO_DISABLE_PERSISTENCE
++  return true;
++#endif
+ 
+   uint8_t* buf = nullptr;
+   size_t len = 0;
+@@ -437,6 +662,11 @@ static bool cred_store_lookup(const uint8_t* id, const size_t idLen, char* rpOut
+   if (rpOut && rpOutMax) rpOut[0] = '\0';
+   if (!id || idLen == 0 || idLen > CRED_MAX_ID_LEN) return false;
+ 
++  if (runtime_cred_lookup(id, idLen, rpOut, rpOutMax, secretOut, secretLenOut)) return true;
++#if FIDO_DISABLE_PERSISTENCE
++  return false;
++#endif
++
+   uint8_t* buf = nullptr;
+   size_t len = 0;
+   uint16_t count = 0;
+@@ -510,7 +740,9 @@ static uint8_t ctap2_parse_pubkey_cred_descriptor(CborValue* descMap, uint8_t* i
+   CborValue dIt;
+   if (cbor_value_enter_container(descMap, &dIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+ 
++  uint16_t descLoopGuard = 0;
+   while (!cbor_value_at_end(&dIt)) {
++    if (++descLoopGuard > 16) return CTAP2_ERR_INVALID_CBOR;
+     bool keyIsType = false;
+     bool keyIsId = false;
+ 
+@@ -521,21 +753,18 @@ static uint8_t ctap2_parse_pubkey_cred_descriptor(CborValue* descMap, uint8_t* i
+       keyIsId = (dk == 0x02);
+       if (cbor_value_advance(&dIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+     } else if (cbor_value_is_text_string(&dIt)) {
+-      char key[24];
+-      size_t keyLen = sizeof(key);
+-      if (cbor_value_copy_text_string(&dIt, key, &keyLen, &dIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+-      keyIsType = (strcmp(key, "type") == 0);
+-      keyIsId = (strcmp(key, "id") == 0);
++      if (cbor_value_text_string_equals(&dIt, "type", &keyIsType) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++      if (cbor_value_text_string_equals(&dIt, "id", &keyIsId) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++      if (cbor_value_advance(&dIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR; // key -> value
+     } else {
+       return CTAP2_ERR_INVALID_CBOR;
+     }
+ 
+     if (keyIsType) {
+       if (!cbor_value_is_text_string(&dIt)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
+-      char tv[16];
+-      size_t tvLen = sizeof(tv);
+-      if (cbor_value_copy_text_string(&dIt, tv, &tvLen, nullptr) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+-      if (strcmp(tv, "public-key") == 0) *typePublicKeyOut = true;
++      bool isPublicKey = false;
++      if (cbor_value_text_string_equals(&dIt, "public-key", &isPublicKey) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++      if (isPublicKey) *typePublicKeyOut = true;
+     } else if (keyIsId) {
+       if (!cbor_value_is_byte_string(&dIt)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
+       size_t n = 0;
+@@ -546,10 +775,10 @@ static uint8_t ctap2_parse_pubkey_cred_descriptor(CborValue* descMap, uint8_t* i
+       *idLenOut = copyLen;
+     }
+ 
+-    if (cbor_value_advance(&dIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++    if (cbor_value_advance(&dIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR; // value -> next key/end
+   }
+ 
+-  cbor_value_leave_container(descMap, &dIt);
++  if (cbor_value_leave_container(descMap, &dIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+   return CTAP2_OK;
+ }
+ 
+@@ -559,10 +788,10 @@ static uint8_t ctap2_get_info(uint8_t* out, const size_t outMax, size_t* outLen)
+   CborEncoder enc;
+   cbor_encoder_init(&enc, out, outMax, 0);
+ 
+-  // Map keys per CTAP2 spec:
+-  // 0x01 versions, 0x03 aaguid, 0x04 options, 0x05 maxMsgSize, 0x08 maxCredIdLength, 0x09 transports
++  // Keep getInfo compact enough to fit a single CTAPHID frame.
++  // Map keys: 0x01 versions, 0x03 aaguid, 0x04 options, 0x05 maxMsgSize
+   CborEncoder map;
+-  if (cbor_encoder_create_map(&enc, &map, 6) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
++  if (cbor_encoder_create_map(&enc, &map, 4) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+ 
+   // versions
+   if (cbor_encode_int(&map, 0x01) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+@@ -578,34 +807,19 @@ static uint8_t ctap2_get_info(uint8_t* out, const size_t outMax, size_t* outLen)
+   // options
+   if (cbor_encode_int(&map, 0x04) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+   CborEncoder opt;
+-  if (cbor_encoder_create_map(&map, &opt, 5) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
++  if (cbor_encoder_create_map(&map, &opt, 3) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+   if (cbor_encode_text_stringz(&opt, "up") != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+   if (cbor_encode_boolean(&opt, true) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+   if (cbor_encode_text_stringz(&opt, "uv") != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+   if (cbor_encode_boolean(&opt, false) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+   if (cbor_encode_text_stringz(&opt, "rk") != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+-  if (cbor_encode_boolean(&opt, false) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+-  if (cbor_encode_text_stringz(&opt, "plat") != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+-  if (cbor_encode_boolean(&opt, false) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+-  if (cbor_encode_text_stringz(&opt, "clientPin") != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+-  if (cbor_encode_boolean(&opt, false) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
++  if (cbor_encode_boolean(&opt, true) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+   if (cbor_encoder_close_container(&map, &opt) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+ 
+   // maxMsgSize
+   if (cbor_encode_int(&map, 0x05) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+   if (cbor_encode_uint(&map, FIDO_MAX_PAYLOAD) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+ 
+-  // maxCredIdLength
+-  if (cbor_encode_int(&map, 0x08) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+-  if (cbor_encode_uint(&map, CRED_MAX_ID_LEN) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+-
+-  // transports
+-  if (cbor_encode_int(&map, 0x09) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+-  CborEncoder transports;
+-  if (cbor_encoder_create_array(&map, &transports, 1) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+-  if (cbor_encode_text_stringz(&transports, "usb") != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+-  if (cbor_encoder_close_container(&map, &transports) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+-
+   if (cbor_encoder_close_container(&enc, &map) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+   *outLen = cbor_encoder_get_buffer_size(&enc, out);
+   return CTAP2_OK;
+@@ -615,12 +829,28 @@ static uint8_t ctap2_make_credential(const uint8_t* req, const size_t reqLen, ui
+   if (!req || !out || !outLen) return CTAP1_ERR_OTHER;
+   *outLen = 0;
+   if (reqLen == 0) return CTAP2_ERR_INVALID_LENGTH;
++  FIDO_LOG("makeCredential: begin reqLen=%u", static_cast<unsigned>(reqLen));
++#if FIDO_FORCE_MAKECRED_EARLY_ERROR
++  FIDO_LOG("makeCredential: forced early error");
++  return CTAP2_ERR_INVALID_CBOR;
++#endif
++  if (reqLen >= 8) {
++    FIDO_LOG("makeCredential: head=%02X%02X%02X%02X tail=%02X%02X%02X%02X", req[0], req[1], req[2], req[3], req[reqLen - 4],
++             req[reqLen - 3], req[reqLen - 2], req[reqLen - 1]);
++  }
++  uint8_t reqHash[32];
++  if (sha256_ret(req, reqLen, reqHash)) {
++    FIDO_LOG("makeCredential: hash=%02X%02X%02X%02X...%02X%02X%02X%02X", reqHash[0], reqHash[1], reqHash[2], reqHash[3],
++             reqHash[28], reqHash[29], reqHash[30], reqHash[31]);
++  }
+ 
+   // Parse request map
+   CborParser parser;
+   CborValue root;
+   if (cbor_parser_init(req, reqLen, 0, &parser, &root) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++  FIDO_LOG("makeCredential: cbor_parser_init ok");
+   if (!cbor_value_is_map(&root)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
++  FIDO_LOG("makeCredential: root is map");
+ 
+   uint8_t clientDataHash[32] = {0};
+   bool haveClientHash = false;
+@@ -637,10 +867,25 @@ static uint8_t ctap2_make_credential(const uint8_t* req, const size_t reqLen, ui
+ 
+   CborValue it;
+   if (cbor_value_enter_container(&root, &it) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++  FIDO_LOG("makeCredential: entered root map");
++  uint16_t topLoopGuard = 0;
++  bool minimalParsedEnough = false;
+   while (!cbor_value_at_end(&it)) {
++    if (++topLoopGuard > 64) return CTAP2_ERR_INVALID_CBOR;
++    bool valueConsumedByLeave = false;
+     int k = 0;
+     if (!cbor_value_is_integer(&it) || cbor_value_get_int(&it, &k) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+     if (cbor_value_advance(&it) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++    FIDO_LOG("makeCredential: key=%d", k);
++
++#if FIDO_STABILITY_MINIMAL_MAKECRED_PARSE
++    if (haveClientHash && haveRpId && (k != 0x01) && (k != 0x02)) {
++      // Stop after the required fields to avoid unstable deep-map traversal paths.
++      FIDO_LOG("makeCredential: minimal parse early exit at key=%d", k);
++      minimalParsedEnough = true;
++      break;
++    }
++#endif
+ 
+     if (k == 0x01) {
+       if (!cbor_value_is_byte_string(&it)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
+@@ -650,16 +895,19 @@ static uint8_t ctap2_make_credential(const uint8_t* req, const size_t reqLen, ui
+       size_t copy = sizeof(clientDataHash);
+       if (cbor_value_copy_byte_string(&it, clientDataHash, &copy, nullptr) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+       haveClientHash = true;
++      FIDO_LOG("makeCredential: key 0x01 ok");
+     } else if (k == 0x02) {
+       if (!cbor_value_is_map(&it)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
+       CborValue rpIt;
+       if (cbor_value_enter_container(&it, &rpIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++      uint16_t rpLoopGuard = 0;
+       while (!cbor_value_at_end(&rpIt)) {
++        if (++rpLoopGuard > 16) return CTAP2_ERR_INVALID_CBOR;
+         if (!cbor_value_is_text_string(&rpIt)) return CTAP2_ERR_INVALID_CBOR;
+-        char key[32];
+-        size_t keyLen = sizeof(key);
+-        if (cbor_value_copy_text_string(&rpIt, key, &keyLen, &rpIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+-        if (strcmp(key, "id") == 0) {
++        bool keyIsId = false;
++        if (cbor_value_text_string_equals(&rpIt, "id", &keyIsId) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++        if (cbor_value_advance(&rpIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR; // key -> value
++        if (keyIsId) {
+           if (!cbor_value_is_text_string(&rpIt)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
+           size_t idLen = 0;
+           if (cbor_value_calculate_string_length(&rpIt, &idLen) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+@@ -669,19 +917,27 @@ static uint8_t ctap2_make_credential(const uint8_t* req, const size_t reqLen, ui
+           rpId[sizeof(rpId) - 1] = '\0';
+           haveRpId = true;
+         }
+-        if (cbor_value_advance(&rpIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++        if (cbor_value_advance(&rpIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR; // value -> next key/end
+       }
+-      cbor_value_leave_container(&it, &rpIt);
++      if (cbor_value_leave_container(&it, &rpIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++      valueConsumedByLeave = true;
++      FIDO_LOG("makeCredential: key 0x02 ok");
+     } else if (k == 0x03) {
+       if (!cbor_value_is_map(&it)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
++#if FIDO_STABILITY_MINIMAL_MAKECRED_PARSE
++      // Stability mode: do not parse user map deeply.
++      FIDO_LOG("makeCredential: key 0x03 skip deep user parse");
++#else
+       CborValue uIt;
+       if (cbor_value_enter_container(&it, &uIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++      uint16_t userLoopGuard = 0;
+       while (!cbor_value_at_end(&uIt)) {
++        if (++userLoopGuard > 24) return CTAP2_ERR_INVALID_CBOR;
+         if (!cbor_value_is_text_string(&uIt)) return CTAP2_ERR_INVALID_CBOR;
+-        char key[32];
+-        size_t keyLen = sizeof(key);
+-        if (cbor_value_copy_text_string(&uIt, key, &keyLen, &uIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+-        if (strcmp(key, "id") == 0) {
++        bool keyIsId = false;
++        if (cbor_value_text_string_equals(&uIt, "id", &keyIsId) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++        if (cbor_value_advance(&uIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR; // key -> value
++        if (keyIsId) {
+           if (!cbor_value_is_byte_string(&uIt)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
+           size_t n = 0;
+           if (cbor_value_calculate_string_length(&uIt, &n) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+@@ -690,96 +946,159 @@ static uint8_t ctap2_make_credential(const uint8_t* req, const size_t reqLen, ui
+           if (cbor_value_copy_byte_string(&uIt, userId, &userIdLen, nullptr) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+           haveUser = true;
+         }
+-        if (cbor_value_advance(&uIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++        if (cbor_value_advance(&uIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR; // value -> next key/end
+       }
+-      cbor_value_leave_container(&it, &uIt);
++      if (cbor_value_leave_container(&it, &uIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++      valueConsumedByLeave = true;
++      FIDO_LOG("makeCredential: key 0x03 ok");
++#endif
+     } else if (k == 0x04) {
+       if (!cbor_value_is_array(&it)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
++#if FIDO_STABILITY_MINIMAL_MAKECRED_PARSE
++      // Stability mode: accept supported algorithm set from platform request
++      // without parsing each descriptor.
++      haveAlg = true;
++      FIDO_LOG("makeCredential: key 0x04 skip deep alg parse");
++#else
+       CborValue aIt;
+       if (cbor_value_enter_container(&it, &aIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++      uint16_t paramsOuterLoopGuard = 0;
+       while (!cbor_value_at_end(&aIt)) {
++        if (++paramsOuterLoopGuard > 16) return CTAP2_ERR_INVALID_CBOR;
+         if (!cbor_value_is_map(&aIt)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
+         bool typeOk = false;
+         bool algOk = false;
+         int alg = 0;
+         CborValue pIt;
+         if (cbor_value_enter_container(&aIt, &pIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++        uint16_t paramsInnerLoopGuard = 0;
+         while (!cbor_value_at_end(&pIt)) {
++          if (++paramsInnerLoopGuard > 12) return CTAP2_ERR_INVALID_CBOR;
+           if (!cbor_value_is_text_string(&pIt)) return CTAP2_ERR_INVALID_CBOR;
+-          char key[32];
+-          size_t keyLen = sizeof(key);
+-          if (cbor_value_copy_text_string(&pIt, key, &keyLen, &pIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+-          if (strcmp(key, "type") == 0) {
++          bool keyIsType = false;
++          bool keyIsAlg = false;
++          if (cbor_value_text_string_equals(&pIt, "type", &keyIsType) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++          if (cbor_value_text_string_equals(&pIt, "alg", &keyIsAlg) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++          if (cbor_value_advance(&pIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR; // key -> value
++          if (keyIsType) {
+             if (!cbor_value_is_text_string(&pIt)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
+-            char tv[16];
+-            size_t tvLen = sizeof(tv);
+-            if (cbor_value_copy_text_string(&pIt, tv, &tvLen, nullptr) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+-            if (strcmp(tv, "public-key") == 0) typeOk = true;
+-          } else if (strcmp(key, "alg") == 0) {
++            bool isPublicKey = false;
++            if (cbor_value_text_string_equals(&pIt, "public-key", &isPublicKey) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++            if (isPublicKey) typeOk = true;
++          } else if (keyIsAlg) {
+             if (!cbor_value_is_integer(&pIt) || cbor_value_get_int(&pIt, &alg) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+             if (alg == -7) algOk = true;
+           }
+-          if (cbor_value_advance(&pIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+-        }
+-        cbor_value_leave_container(&aIt, &pIt);
+-        if (typeOk && algOk) {
+-          haveAlg = true;
+-          break;
++          if (cbor_value_advance(&pIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR; // value -> next key/end
+         }
++        if (cbor_value_leave_container(&aIt, &pIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++        if (typeOk && algOk) haveAlg = true;
+         if (cbor_value_advance(&aIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+       }
+-      cbor_value_leave_container(&it, &aIt);
++      if (cbor_value_leave_container(&it, &aIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++      valueConsumedByLeave = true;
++      FIDO_LOG("makeCredential: key 0x04 ok alg=%u", static_cast<unsigned>(haveAlg));
++#endif
+     } else if (k == 0x05) {
+       // excludeList
+       if (!cbor_value_is_array(&it)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
++#if FIDO_STABILITY_SKIP_CRED_DESCRIPTOR_PARSE
++      // Stability mode: skip parsing credential descriptors to avoid parser crash paths.
++      FIDO_LOG("makeCredential: key 0x05 skip descriptor parsing");
++#else
+       CborValue exIt;
+       if (cbor_value_enter_container(&it, &exIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++      uint16_t excludeLoopGuard = 0;
+       while (!cbor_value_at_end(&exIt)) {
++        if (++excludeLoopGuard > 16) return CTAP2_ERR_INVALID_CBOR;
+         uint8_t cid[CRED_MAX_ID_LEN];
+         size_t cidLen = 0;
+         bool typePublicKey = false;
+         const uint8_t st = ctap2_parse_pubkey_cred_descriptor(&exIt, cid, sizeof(cid), &cidLen, &typePublicKey);
+         if (st != CTAP2_OK) return st;
+         if (typePublicKey && cidLen > 0 && cred_store_id_exists(cid, cidLen)) excludeHit = true;
+-        if (excludeHit) break;
+         if (cbor_value_advance(&exIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+       }
+-      cbor_value_leave_container(&it, &exIt);
++      if (cbor_value_leave_container(&it, &exIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++      valueConsumedByLeave = true;
++      FIDO_LOG("makeCredential: key 0x05 ok excludeHit=%u", static_cast<unsigned>(excludeHit));
++#endif
+     } else if (k == 0x07) {
+       // options
+       if (!cbor_value_is_map(&it)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
++#if FIDO_STABILITY_MINIMAL_MAKECRED_PARSE
++      FIDO_LOG("makeCredential: key 0x07 skip options parse");
++#else
+       CborValue oIt;
+       if (cbor_value_enter_container(&it, &oIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++      uint16_t optionsLoopGuard = 0;
+       while (!cbor_value_at_end(&oIt)) {
++        if (++optionsLoopGuard > 12) return CTAP2_ERR_INVALID_CBOR;
+         if (!cbor_value_is_text_string(&oIt)) return CTAP2_ERR_INVALID_CBOR;
+-        char key[32];
+-        size_t keyLen = sizeof(key);
+-        if (cbor_value_copy_text_string(&oIt, key, &keyLen, &oIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++        bool keyIsRk = false;
++        bool keyIsUv = false;
++        if (cbor_value_text_string_equals(&oIt, "rk", &keyIsRk) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++        if (cbor_value_text_string_equals(&oIt, "uv", &keyIsUv) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++        if (cbor_value_advance(&oIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR; // key -> value
+         if (!cbor_value_is_boolean(&oIt)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
+         bool v = false;
+         if (cbor_value_get_boolean(&oIt, &v) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+-        if (strcmp(key, "rk") == 0) optionRk = v;
+-        else if (strcmp(key, "uv") == 0) optionUv = v;
++        if (keyIsRk) optionRk = v;
++        else if (keyIsUv) optionUv = v;
+         if (cbor_value_advance(&oIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+       }
+-      cbor_value_leave_container(&it, &oIt);
++      if (cbor_value_leave_container(&it, &oIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++      valueConsumedByLeave = true;
++      FIDO_LOG("makeCredential: key 0x07 ok rk=%u uv=%u", static_cast<unsigned>(optionRk), static_cast<unsigned>(optionUv));
++#endif
+     } else if (k == 0x08 || k == 0x09) {
+       // pinUvAuthParam / pinUvAuthProtocol present -> not supported
+       return CTAP2_ERR_PIN_REQUIRED;
+     }
+ 
+-    if (cbor_value_advance(&it) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++    if (!valueConsumedByLeave) {
++      if (cbor_value_advance(&it) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++    }
+   }
++#if FIDO_STABILITY_MINIMAL_MAKECRED_PARSE
++  if (!minimalParsedEnough) cbor_value_leave_container(&root, &it);
++#else
+   cbor_value_leave_container(&root, &it);
++#endif
++  FIDO_LOG("makeCredential: finished parse loop");
++
++#if FIDO_STABILITY_MINIMAL_MAKECRED_PARSE
++  haveUser = true;
++  haveAlg = true;
++#endif
+ 
+   if (excludeHit) return CTAP2_ERR_CREDENTIAL_EXCLUDED;
+   if (!haveClientHash || !haveRpId || !haveUser) return CTAP2_ERR_MISSING_PARAMETER;
+   if (!haveAlg) return CTAP2_ERR_UNSUPPORTED_ALGORITHM;
+-  if (optionUv || optionRk) return CTAP2_ERR_UNSUPPORTED_OPTION;
++  if (optionUv) return CTAP2_ERR_UNSUPPORTED_OPTION;
++  FIDO_LOG("makeCredential: parsed rpId=%s userIdLen=%u optionRk=%u", rpId, static_cast<unsigned>(userIdLen),
++           static_cast<unsigned>(optionRk));
++
++#if FIDO_MAKECRED_TEST_STAGE == 1
++  FIDO_LOG("makeCredential: test-stage 1 (after parse)");
++  return CTAP2_ERR_INVALID_CBOR;
++#endif
++
++#if FIDO_FORCE_MAKECRED_PARSE_ONLY_ERROR
++  FIDO_LOG("makeCredential: forced parse-only error");
++  return CTAP2_ERR_INVALID_CBOR;
++#endif
+ 
+   // Create keypair and credentialId
+   EcKeyPair kp;
++  FIDO_LOG("makeCredential: ec_generate start");
+   if (!ec_generate(&kp)) return CTAP2_ERR_PROCESSING;
++  FIDO_LOG("makeCredential: ec_generate done");
++
++#if FIDO_MAKECRED_TEST_STAGE == 2
++  FIDO_LOG("makeCredential: test-stage 2 (after keygen)");
++  return CTAP2_ERR_INVALID_CBOR;
++#endif
+ 
+   uint8_t credId[16];
+   for (uint8_t tries = 0; tries < 10; ++tries) {
+@@ -787,21 +1106,35 @@ static uint8_t ctap2_make_credential(const uint8_t* req, const size_t reqLen, ui
+     if (!cred_store_id_exists(credId, sizeof(credId))) break;
+   }
+   if (cred_store_id_exists(credId, sizeof(credId))) return CTAP2_ERR_KEY_STORE_FULL;
++  FIDO_LOG("makeCredential: credId allocated");
+ 
+   uint8_t secret[CRED_MAX_SECRET_LEN];
+   size_t secretLen = 0;
+-  if (!build_cred_secret(false, userId, userIdLen, kp.priv, secret, &secretLen)) return CTAP2_ERR_PROCESSING;
++  FIDO_LOG("makeCredential: build_cred_secret start");
++  if (!build_cred_secret(optionRk, userId, userIdLen, kp.priv, secret, &secretLen)) return CTAP2_ERR_PROCESSING;
++  FIDO_LOG("makeCredential: build_cred_secret done len=%u", static_cast<unsigned>(secretLen));
+ 
++  FIDO_LOG("makeCredential: cred_store_add start");
+   if (!cred_store_add_credential(rpId, credId, sizeof(credId), secret, secretLen)) return CTAP2_ERR_KEY_STORE_FULL;
++  FIDO_LOG("makeCredential: cred_store_add done");
++
++#if FIDO_MAKECRED_TEST_STAGE == 3
++  FIDO_LOG("makeCredential: test-stage 3 (after store)");
++  return CTAP2_ERR_INVALID_CBOR;
++#endif
+ 
+   // Build COSE public key
+   uint8_t cose[96];
+   size_t coseLen = 0;
++  FIDO_LOG("makeCredential: build cose start");
+   if (!ctap2_build_cose_p256_es256(kp.x, kp.y, cose, sizeof(cose), &coseLen)) return CTAP2_ERR_PROCESSING;
++  FIDO_LOG("makeCredential: build cose done len=%u", static_cast<unsigned>(coseLen));
+ 
+   // Build authenticatorData
+   uint8_t rpIdHash[32];
++  FIDO_LOG("makeCredential: rpId hash start");
+   if (!sha256_ret(reinterpret_cast<const uint8_t*>(rpId), strlen(rpId), rpIdHash)) return CTAP2_ERR_PROCESSING;
++  FIDO_LOG("makeCredential: rpId hash done");
+ 
+   uint8_t authData[256];
+   size_t authLen = 0;
+@@ -835,6 +1168,12 @@ static uint8_t ctap2_make_credential(const uint8_t* req, const size_t reqLen, ui
+     if (!sha256_ret(msg, msgLen, msgHash)) return CTAP2_ERR_PROCESSING;
+     if (!ec_sign_der(kp.priv, msgHash, sigDer, sizeof(sigDer), &sigLen)) return CTAP2_ERR_PROCESSING;
+   }
++  FIDO_LOG("makeCredential: attestation done fmt=%s sigLen=%u", fmt, static_cast<unsigned>(sigLen));
++
++#if FIDO_MAKECRED_TEST_STAGE == 4
++  FIDO_LOG("makeCredential: test-stage 4 (after attestation)");
++  return CTAP2_ERR_INVALID_CBOR;
++#endif
+ 
+   // Build response map (definite length)
+   CborEncoder enc;
+@@ -858,6 +1197,7 @@ static uint8_t ctap2_make_credential(const uint8_t* req, const size_t reqLen, ui
+   if (cbor_encoder_close_container(&map, &att) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+   if (cbor_encoder_close_container(&enc, &map) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+   *outLen = cbor_encoder_get_buffer_size(&enc, out);
++  FIDO_LOG("makeCredential: response cborLen=%u", static_cast<unsigned>(*outLen));
+   FIDO_LOG("makeCredential OK rpId=%s credIdLen=%u authDataLen=%u fmt=%s", rpId, static_cast<unsigned>(sizeof(credId)),
+            static_cast<unsigned>(authLen), fmt);
+   return CTAP2_OK;
+@@ -867,11 +1207,13 @@ static uint8_t ctap2_get_assertion(const uint8_t* req, const size_t reqLen, uint
+   if (!req || !out || !outLen) return CTAP1_ERR_OTHER;
+   *outLen = 0;
+   if (reqLen == 0) return CTAP2_ERR_INVALID_LENGTH;
++  FIDO_LOG("getAssertion: begin reqLen=%u", static_cast<unsigned>(reqLen));
+ 
+   CborParser parser;
+   CborValue root;
+   if (cbor_parser_init(req, reqLen, 0, &parser, &root) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+   if (!cbor_value_is_map(&root)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
++  FIDO_LOG("getAssertion: root is map");
+ 
+   char rpId[CRED_MAX_RPID_LEN + 1];
+   rpId[0] = '\0';
+@@ -894,10 +1236,23 @@ static uint8_t ctap2_get_assertion(const uint8_t* req, const size_t reqLen, uint
+ 
+   CborValue it;
+   if (cbor_value_enter_container(&root, &it) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++  uint16_t topLoopGuard = 0;
++  bool minimalParsedEnough = false;
+   while (!cbor_value_at_end(&it)) {
++    if (++topLoopGuard > 64) return CTAP2_ERR_INVALID_CBOR;
++    bool valueConsumedByLeave = false;
+     int k = 0;
+     if (!cbor_value_is_integer(&it) || cbor_value_get_int(&it, &k) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+     if (cbor_value_advance(&it) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++    FIDO_LOG("getAssertion: key=%d", k);
++
++#if FIDO_STABILITY_MINIMAL_MAKECRED_PARSE
++    if (haveRpId && haveClientHash && (k != 0x01) && (k != 0x02)) {
++      FIDO_LOG("getAssertion: minimal parse early exit at key=%d", k);
++      minimalParsedEnough = true;
++      break;
++    }
++#endif
+ 
+     if (k == 0x01) {
+       if (!cbor_value_is_text_string(&it)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
+@@ -908,6 +1263,7 @@ static uint8_t ctap2_get_assertion(const uint8_t* req, const size_t reqLen, uint
+       if (cbor_value_copy_text_string(&it, rpId, &copyLen, nullptr) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+       rpId[sizeof(rpId) - 1] = '\0';
+       haveRpId = true;
++      FIDO_LOG("getAssertion: key 0x01 rpId=%s", rpId);
+     } else if (k == 0x02) {
+       if (!cbor_value_is_byte_string(&it)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
+       size_t n = 0;
+@@ -916,11 +1272,19 @@ static uint8_t ctap2_get_assertion(const uint8_t* req, const size_t reqLen, uint
+       size_t copy = sizeof(clientDataHash);
+       if (cbor_value_copy_byte_string(&it, clientDataHash, &copy, nullptr) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+       haveClientHash = true;
++      FIDO_LOG("getAssertion: key 0x02 clientDataHash ok");
+     } else if (k == 0x03) {
+       if (!cbor_value_is_array(&it)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
++#if FIDO_STABILITY_SKIP_CRED_DESCRIPTOR_PARSE
++      // Stability mode: skip allowList descriptor parsing; silent probing will
++      // return NO_CREDENTIALS without touching descriptor internals.
++      FIDO_LOG("getAssertion: key 0x03 skip descriptor parsing");
++#else
+       CborValue aIt;
+       if (cbor_value_enter_container(&it, &aIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++      uint16_t allowListLoopGuard = 0;
+       while (!cbor_value_at_end(&aIt)) {
++        if (++allowListLoopGuard > 16) return CTAP2_ERR_INVALID_CBOR;
+         uint8_t cid[CRED_MAX_ID_LEN];
+         size_t cidLen = 0;
+         bool typePublicKey = false;
+@@ -934,32 +1298,47 @@ static uint8_t ctap2_get_assertion(const uint8_t* req, const size_t reqLen, uint
+         }
+         if (cbor_value_advance(&aIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+       }
+-      cbor_value_leave_container(&it, &aIt);
++      if (cbor_value_leave_container(&it, &aIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++      valueConsumedByLeave = true;
++      FIDO_LOG("getAssertion: key 0x03 allowCredCount=%u", static_cast<unsigned>(allowCredCount));
++#endif
+     } else if (k == 0x05) {
+       // options
+       if (!cbor_value_is_map(&it)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
+       CborValue oIt;
+       if (cbor_value_enter_container(&it, &oIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++      uint16_t optionsLoopGuard = 0;
+       while (!cbor_value_at_end(&oIt)) {
++        if (++optionsLoopGuard > 12) return CTAP2_ERR_INVALID_CBOR;
+         if (!cbor_value_is_text_string(&oIt)) return CTAP2_ERR_INVALID_CBOR;
+-        char key[32];
+-        size_t keyLen = sizeof(key);
+-        if (cbor_value_copy_text_string(&oIt, key, &keyLen, &oIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++        bool keyIsUv = false;
++        if (cbor_value_text_string_equals(&oIt, "uv", &keyIsUv) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++        if (cbor_value_advance(&oIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR; // key -> value
+         if (!cbor_value_is_boolean(&oIt)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
+         bool v = false;
+         if (cbor_value_get_boolean(&oIt, &v) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+-        if (strcmp(key, "uv") == 0) optionUv = v;
++        if (keyIsUv) optionUv = v;
+         if (cbor_value_advance(&oIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+       }
+-      cbor_value_leave_container(&it, &oIt);
++      if (cbor_value_leave_container(&it, &oIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++      valueConsumedByLeave = true;
++      FIDO_LOG("getAssertion: key 0x05 options uv=%u", static_cast<unsigned>(optionUv));
+     } else if (k == 0x06 || k == 0x07) {
+       // pinUvAuthParam / pinUvAuthProtocol present -> not supported
+       return CTAP2_ERR_PIN_REQUIRED;
+     }
+ 
+-    if (cbor_value_advance(&it) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++    if (!valueConsumedByLeave) {
++      if (cbor_value_advance(&it) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
++    }
+   }
++#if FIDO_STABILITY_MINIMAL_MAKECRED_PARSE
++  if (!minimalParsedEnough) cbor_value_leave_container(&root, &it);
++#else
+   cbor_value_leave_container(&root, &it);
++#endif
++  FIDO_LOG("getAssertion: parse done haveRpId=%u haveClientHash=%u allowCredCount=%u", static_cast<unsigned>(haveRpId),
++           static_cast<unsigned>(haveClientHash), static_cast<unsigned>(allowCredCount));
+ 
+   if (!haveRpId || !haveClientHash) return CTAP2_ERR_MISSING_PARAMETER;
+   if (optionUv) return CTAP2_ERR_UNSUPPORTED_OPTION;
+@@ -978,6 +1357,14 @@ static uint8_t ctap2_get_assertion(const uint8_t* req, const size_t reqLen, uint
+     }
+     secure_zero(secret, secretLen);
+   }
++  if (!haveCred && allowCredCount == 0) {
++    if (runtime_cred_lookup_by_rpid(rpId, selectedCredId, sizeof(selectedCredId), &selectedCredIdLen, selectedSecret,
++                                    sizeof(selectedSecret), &selectedSecretLen)) {
++      haveCred = true;
++      FIDO_LOG("getAssertion: runtime rp fallback selected idLen=%u", static_cast<unsigned>(selectedCredIdLen));
++    }
++  }
++  FIDO_LOG("getAssertion: credential matched=%u", static_cast<unsigned>(haveCred));
+   if (!haveCred) return CTAP2_ERR_NO_CREDENTIALS;
+ 
+   bool rk = false;
+@@ -1038,13 +1425,20 @@ static uint8_t ctap2_get_assertion(const uint8_t* req, const size_t reqLen, uint
+ }
+ 
+ static uint8_t ctap2_reset() {
++  runtime_cred_clear();
++#if !FIDO_DISABLE_PERSISTENCE
+   cred_store_clear();
++#endif
+   fidoSignCount = 0;
+   save_sign_count(0);
+   return CTAP2_OK;
+ }
+ 
++#if USB_ENABLE_KBM_HID
++static const uint8_t fido_report_descriptor[] = {TUD_HID_REPORT_DESC_FIDO_U2F(FIDO_HID_PACKET_SIZE, HID_REPORT_ID(FIDO_HID_REPORT_ID))};
++#else
+ static const uint8_t fido_report_descriptor[] = {TUD_HID_REPORT_DESC_FIDO_U2F(FIDO_HID_PACKET_SIZE)};
++#endif
+ 
+ struct FidoRxState {
+   bool active = false;
+@@ -1080,11 +1474,91 @@ struct PendingCtap {
+ 
+ static PendingCtap pendingCtap;
+ 
++struct ActiveCtap {
++  volatile bool active = false;
++  volatile uint32_t cid = 0;
++};
++
++static ActiveCtap activeCtap;
++static portMUX_TYPE fidoFeatureQueueMux = portMUX_INITIALIZER_UNLOCKED;
++
+ static void fido_hid_on_packet(const uint8_t* buffer, uint16_t lenBytes);
+ 
+ class USBHIDFidoDevice final : public USBHIDDevice {
+ private:
+   USBHID hid;
++  static constexpr uint8_t FEATURE_QUEUE_DEPTH = 24;
++  uint8_t featureQueue[FEATURE_QUEUE_DEPTH][FIDO_HID_PACKET_SIZE];
++  uint8_t featureHead = 0;
++  uint8_t featureTail = 0;
++  uint8_t featureCount = 0;
++
++  void queueFeaturePacket(const uint8_t* data, size_t lenBytes) {
++    if (!data || lenBytes != FIDO_HID_PACKET_SIZE) return;
++    portENTER_CRITICAL(&fidoFeatureQueueMux);
++    memcpy(featureQueue[featureTail], data, FIDO_HID_PACKET_SIZE);
++    featureTail = static_cast<uint8_t>((featureTail + 1U) % FEATURE_QUEUE_DEPTH);
++    if (featureCount < FEATURE_QUEUE_DEPTH) {
++      featureCount++;
++    } else {
++      // Drop oldest packet when full.
++      featureHead = static_cast<uint8_t>((featureHead + 1U) % FEATURE_QUEUE_DEPTH);
++    }
++    portEXIT_CRITICAL(&fidoFeatureQueueMux);
++  }
++
++  bool popFeaturePacket(uint8_t* out) {
++    if (!out) return false;
++    portENTER_CRITICAL(&fidoFeatureQueueMux);
++    if (featureCount == 0) {
++      portEXIT_CRITICAL(&fidoFeatureQueueMux);
++      return false;
++    }
++    memcpy(out, featureQueue[featureHead], FIDO_HID_PACKET_SIZE);
++    featureHead = static_cast<uint8_t>((featureHead + 1U) % FEATURE_QUEUE_DEPTH);
++    featureCount--;
++    portEXIT_CRITICAL(&fidoFeatureQueueMux);
++    return true;
++  }
++
++  void clearFeatureQueue() {
++    portENTER_CRITICAL(&fidoFeatureQueueMux);
++    featureHead = 0;
++    featureTail = 0;
++    featureCount = 0;
++    portEXIT_CRITICAL(&fidoFeatureQueueMux);
++  }
++
++  void dispatchNormalizedPacket(const uint8_t* pkt64) {
++    if (!pkt64) return;
++    fido_hid_on_packet(pkt64, FIDO_HID_PACKET_SIZE);
++  }
++
++  void handleIncomingReport(uint8_t report_id, const uint8_t* buffer, uint16_t lenBytes) {
++    if (!buffer) return;
++    const bool noReportIdMode = (FIDO_HID_REPORT_ID == HID_REPORT_ID_NONE);
++    if (!noReportIdMode && report_id != 0 && report_id != FIDO_HID_REPORT_ID) return;
++
++    if (lenBytes == FIDO_HID_PACKET_SIZE) {
++      dispatchNormalizedPacket(buffer);
++      return;
++    }
++
++    // Some host paths deliver 65-byte reports with a leading report-ID byte.
++    if (lenBytes == (FIDO_HID_PACKET_SIZE + 1)) {
++      if (noReportIdMode) {
++        // In no-report-ID descriptor mode, host APIs still prepend report-id 0.
++        dispatchNormalizedPacket(buffer + 1);
++      } else if (buffer[0] == 0 || buffer[0] == FIDO_HID_REPORT_ID) {
++        dispatchNormalizedPacket(buffer + 1);
++      } else {
++        dispatchNormalizedPacket(buffer);
++      }
++      return;
++    }
++
++    fido_hid_on_packet(buffer, lenBytes);
++  }
+ 
+ public:
+   USBHIDFidoDevice() : hid(HID_ITF_PROTOCOL_NONE) {
+@@ -1095,18 +1569,101 @@ public:
+     }
+   }
+ 
+-  void begin() { hid.begin(); }
++  void begin() {
++    hid.begin();
++    clearFeatureQueue();
++  }
++
++  void clearQueue() { clearFeatureQueue(); }
++
++  void task() {}
+ 
+-  bool sendPacket(const uint8_t* data, const size_t lenBytes) { return hid.SendReport(0, data, lenBytes, 100); }
++  bool sendPacket(const uint8_t* data, const size_t lenBytes) {
++    queueFeaturePacket(data, lenBytes);
++    return hid.SendReport(FIDO_HID_REPORT_ID, data, lenBytes, 100);
++  }
+ 
+   uint16_t _onGetDescriptor(uint8_t* dst) override {
+     memcpy(dst, fido_report_descriptor, sizeof(fido_report_descriptor));
+     return sizeof(fido_report_descriptor);
+   }
+ 
++  uint16_t _onGetFeature(uint8_t report_id, uint8_t* buffer, uint16_t lenBytes) override {
++    if (!buffer) return 0;
++    const bool noReportIdMode = (FIDO_HID_REPORT_ID == HID_REPORT_ID_NONE);
++    if (!noReportIdMode && report_id != 0 && report_id != FIDO_HID_REPORT_ID) return 0;
++
++    uint8_t pkt[FIDO_HID_PACKET_SIZE];
++    if (!popFeaturePacket(pkt)) {
++      // If host polls before a command is fully processed, answer with keepalive
++      // instead of an empty/stale frame.
++      uint32_t kaCid = 0;
++      uint8_t kaStatus = CTAPHID_KEEPALIVE_STATUS_PROCESSING;
++      bool haveKeepalive = false;
++      if (pendingCtap.active) {
++        haveKeepalive = true;
++        kaCid = pendingCtap.cid;
++#if FIDO_REQUIRE_BOOT_BUTTON_FOR_UP
++        kaStatus = CTAPHID_KEEPALIVE_STATUS_UP_NEEDED;
++#endif
++      } else if (activeCtap.active) {
++        haveKeepalive = true;
++        kaCid = activeCtap.cid;
++      } else if (fidoReq.ready) {
++        haveKeepalive = true;
++        kaCid = fidoReq.cid;
++      } else if (fidoRx.active) {
++        haveKeepalive = true;
++        kaCid = fidoRx.cid;
++      }
++
++      if (haveKeepalive && kaCid != 0) {
++        memset(pkt, 0, sizeof(pkt));
++        write_be_u32(pkt + 0, kaCid);
++        pkt[4] = static_cast<uint8_t>(0x80U | (CTAPHID_CMD_KEEPALIVE & 0x7FU));
++        write_be_u16(pkt + 5, 1);
++        pkt[7] = kaStatus;
++      } else {
++        memset(pkt, 0, sizeof(pkt));
++      }
++    }
++
++    if (noReportIdMode) {
++      if (lenBytes >= FIDO_HID_PACKET_SIZE) {
++        memcpy(buffer, pkt, FIDO_HID_PACKET_SIZE);
++        return FIDO_HID_PACKET_SIZE;
++      }
++      memset(buffer, 0, lenBytes);
++      return lenBytes;
++    }
++
++    if (lenBytes >= (FIDO_HID_PACKET_SIZE + 1U)) {
++      buffer[0] = FIDO_HID_REPORT_ID;
++      memcpy(buffer + 1, pkt, FIDO_HID_PACKET_SIZE);
++      return static_cast<uint16_t>(FIDO_HID_PACKET_SIZE + 1U);
++    }
++    if (lenBytes >= FIDO_HID_PACKET_SIZE) {
++      memcpy(buffer, pkt, FIDO_HID_PACKET_SIZE);
++      return FIDO_HID_PACKET_SIZE;
++    }
++    memset(buffer, 0, lenBytes);
++    return lenBytes;
++  }
++
+   void _onOutput(uint8_t report_id, const uint8_t* buffer, uint16_t lenBytes) override {
+-    (void)report_id;
+-    fido_hid_on_packet(buffer, lenBytes);
++    handleIncomingReport(report_id, buffer, lenBytes);
++  }
++
++  void _onSetFeature(uint8_t report_id, const uint8_t* buffer, uint16_t lenBytes) override {
++    // ESP32 Arduino's TinyUSB shim can route report-id traffic via SetFeature.
++    // Handle it the same way so CTAPHID packets are not dropped on Windows.
++    const bool noReportIdMode = (FIDO_HID_REPORT_ID == HID_REPORT_ID_NONE);
++    handleIncomingReport(report_id, buffer, lenBytes);
++    if (!noReportIdMode && report_id != 0 && report_id != FIDO_HID_REPORT_ID) {
++      // Some host paths can surface feature packets with an unexpected report_id.
++      // Retry as report_id 0 so raw 64-byte CTAPHID frames are still parsed.
++      handleIncomingReport(0, buffer, lenBytes);
++    }
+   }
+ };
+ 
+@@ -1216,6 +1773,12 @@ static void fido_hid_on_packet(const uint8_t* buffer, const uint16_t lenBytes) {
+     return;
+   }
+   if (b4 != fidoRx.nextSeq) {
++    // Some host paths can replay the immediately previous continuation frame.
++    // Ignore harmless duplicates instead of aborting the full transaction.
++    if (fidoRx.nextSeq > 0 && b4 == static_cast<uint8_t>(fidoRx.nextSeq - 1U)) {
++      fidoRx.lastMs = now;
++      return;
++    }
+     fido_send_error(cid, CTAPHID_ERR_INVALID_SEQ);
+     fidoRx.active = false;
+     return;
+@@ -1260,6 +1823,7 @@ static void fido_handle_init(const uint32_t cid, const uint8_t* data, const size
+   fidoReq.ready = false;
+   pendingCtap.active = false;
+   fidoAwaitingUserPresence = false;
++  fidoHid.clearQueue();
+   fidoAssignedCid = newCid;
+ 
+   write_be_u32(resp + 8, newCid);
+@@ -1267,7 +1831,8 @@ static void fido_handle_init(const uint32_t cid, const uint8_t* data, const size
+   resp[13] = 1;    // major
+   resp[14] = 0;    // minor
+   resp[15] = 0;    // build
+-  resp[16] = static_cast<uint8_t>(CTAPHID_CAP_WINK | CTAPHID_CAP_CBOR | CTAPHID_CAP_NMSG);
++  // Match behavior used by known-good TinyUSB implementations (WINK + CBOR).
++  resp[16] = static_cast<uint8_t>(CTAPHID_CAP_WINK | CTAPHID_CAP_CBOR);
+   fido_send_response(cid, CTAPHID_CMD_INIT, resp, sizeof(resp));
+ }
+ 
+@@ -1286,8 +1851,15 @@ static void fido_start_pending(const uint32_t cid, const uint8_t ctapCmd, const
+   pendingCtap.len = static_cast<uint16_t>(len);
+   if (len && data) memcpy(pendingCtap.data, data, len);
+   pendingCtap.startedMs = millis();
+-  pendingCtap.lastKeepaliveMs = 0;
++  pendingCtap.lastKeepaliveMs = pendingCtap.startedMs;
+   fidoAwaitingUserPresence = true;
++#if FIDO_REQUIRE_BOOT_BUTTON_FOR_UP
++  fido_send_keepalive(cid, CTAPHID_KEEPALIVE_STATUS_UP_NEEDED);
++#else
++  // Queue an immediate keepalive so host GetFeature does not read an empty frame
++  // while this request is still pending.
++  fido_send_keepalive(cid, CTAPHID_KEEPALIVE_STATUS_PROCESSING);
++#endif
+   FIDO_LOG("Pending start cid=%08lX cmd=%s(0x%02X) len=%u", static_cast<unsigned long>(cid), ctap_cmd_name(ctapCmd), ctapCmd,
+            static_cast<unsigned>(len));
+ }
+@@ -1335,9 +1907,38 @@ static void fido_handle_cbor(const uint32_t cid, const uint8_t* data, const size
+     return;
+   }
+ 
++  if (ctapCmd == CTAP_CMD_MAKE_CREDENTIAL) {
++#if FIDO_FORCE_DIRECT_MAKECRED_ERROR
++    // Isolation mode: prove large request reassembly + immediate CBOR response path.
++    fido_send_ctap2_status(cid, CTAP2_ERR_INVALID_CBOR, nullptr, 0);
++    return;
++#endif
++  }
++
++#if !FIDO_REQUIRE_BOOT_BUTTON_FOR_UP
++  // Auto-approve mode: execute request immediately to avoid host-side feature-poll
++  // timing races while waiting on a pending operation.
++  if (ctapCmd == CTAP_CMD_MAKE_CREDENTIAL || ctapCmd == CTAP_CMD_GET_ASSERTION || ctapCmd == CTAP_CMD_RESET) {
++    uint8_t body[512];
++    size_t bodyLen = 0;
++    uint8_t st = CTAP1_ERR_OTHER;
++    activeCtap.cid = cid;
++    activeCtap.active = true;
++    if (ctapCmd == CTAP_CMD_MAKE_CREDENTIAL) {
++      st = ctap2_make_credential(payload, payloadLen, body, sizeof(body), &bodyLen);
++    } else if (ctapCmd == CTAP_CMD_GET_ASSERTION) {
++      st = ctap2_get_assertion(payload, payloadLen, body, sizeof(body), &bodyLen);
++    } else {
++      st = ctap2_reset();
++    }
++    activeCtap.active = false;
++    fido_send_ctap2_status(cid, st, body, bodyLen);
++    return;
++  }
++#endif
++
+   if (ctapCmd == CTAP_CMD_MAKE_CREDENTIAL || ctapCmd == CTAP_CMD_GET_ASSERTION || ctapCmd == CTAP_CMD_RESET) {
+     fido_start_pending(cid, ctapCmd, payload, payloadLen);
+-    fido_send_keepalive(cid, CTAPHID_KEEPALIVE_STATUS_UP_NEEDED);
+     return;
+   }
+ 
+@@ -1380,7 +1981,9 @@ static void fido_tick_pending() {
+ 
+   const uint32_t now = millis();
+   const uint32_t cid = pendingCtap.cid;
++  bool upSatisfied = false;
+ 
++#if FIDO_REQUIRE_BOOT_BUTTON_FOR_UP
+   if (static_cast<int32_t>(now - pendingCtap.startedMs) > static_cast<int32_t>(CTAP_UP_TIMEOUT_MS)) {
+     pendingCtap.active = false;
+     fidoAwaitingUserPresence = false;
+@@ -1389,18 +1992,27 @@ static void fido_tick_pending() {
+     return;
+   }
+ 
+-  if (pendingCtap.lastKeepaliveMs == 0 ||
+-      (static_cast<int32_t>(now - pendingCtap.lastKeepaliveMs) >= static_cast<int32_t>(CTAP_KEEPALIVE_EVERY_MS))) {
++  if (static_cast<int32_t>(now - pendingCtap.lastKeepaliveMs) >= static_cast<int32_t>(CTAP_KEEPALIVE_EVERY_MS)) {
+     pendingCtap.lastKeepaliveMs = now;
+     fido_send_keepalive(cid, CTAPHID_KEEPALIVE_STATUS_UP_NEEDED);
+   }
+ 
+-  if (!boot_button_down()) return;
++  upSatisfied = boot_button_down();
++#else
++  if (static_cast<int32_t>(now - pendingCtap.lastKeepaliveMs) >= static_cast<int32_t>(CTAP_KEEPALIVE_EVERY_MS)) {
++    pendingCtap.lastKeepaliveMs = now;
++    fido_send_keepalive(cid, CTAPHID_KEEPALIVE_STATUS_PROCESSING);
++  }
++  upSatisfied = static_cast<int32_t>(now - pendingCtap.startedMs) >= static_cast<int32_t>(CTAP_UP_AUTO_APPROVE_MS);
++#endif
++  if (!upSatisfied) return;
+   FIDO_LOG("User presence satisfied cid=%08lX", static_cast<unsigned long>(cid));
+ 
+   uint8_t body[512];
+   size_t bodyLen = 0;
+   uint8_t st = CTAP1_ERR_OTHER;
++  activeCtap.cid = cid;
++  activeCtap.active = true;
+ 
+   if (pendingCtap.cmd == CTAP_CMD_MAKE_CREDENTIAL) {
+     st = ctap2_make_credential(pendingCtap.data, pendingCtap.len, body, sizeof(body), &bodyLen);
+@@ -1411,6 +2023,7 @@ static void fido_tick_pending() {
+   } else {
+     st = CTAP2_ERR_INVALID_COMMAND;
+   }
++  activeCtap.active = false;
+ 
+   pendingCtap.active = false;
+   fidoAwaitingUserPresence = false;
+@@ -1423,7 +2036,11 @@ void fido_begin() {
+   fidoRx.active = false;
+   fidoReq.ready = false;
+   pendingCtap.active = false;
++  activeCtap.active = false;
++  activeCtap.cid = 0;
+   fidoAwaitingUserPresence = false;
++  fidoHid.clearQueue();
++  runtime_cred_clear();
+   fidoSignCount = load_sign_count();
+   FIDO_LOG("FIDO init signCount=%lu debug=%u", static_cast<unsigned long>(fidoSignCount), static_cast<unsigned>(FIDO_DEBUG));
+ }
+@@ -1433,6 +2050,7 @@ bool fido_waiting_for_user_presence() {
+ }
+ 
+ void fido_task() {
++  fidoHid.task();
+   // Drop partial messages that time out.
+   if (fidoRx.active && (static_cast<int32_t>(millis() - fidoRx.lastMs) > 1000)) {
+     fidoRx.active = false;
