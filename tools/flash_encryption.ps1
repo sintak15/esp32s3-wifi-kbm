@@ -13,7 +13,7 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $BuildDir = Join-Path $RepoRoot "build"
 $SketchName = "esp32s3-wifi-kbm.ino"
-$Fqbn = "esp32:esp32:esp32s3"
+$Fqbn = "esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=cdc,UploadMode=cdc"
 
 function Find-ArduinoCli {
   $cmd = Get-Command "arduino-cli" -ErrorAction SilentlyContinue

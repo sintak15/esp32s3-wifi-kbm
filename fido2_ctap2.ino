@@ -10,7 +10,7 @@
 // - authenticatorReset (0x07), user presence (BOOT)
 //
 // Not supported:
-// - ClientPIN / user verification (PIN/biometric)
+// - Full CTAP2.1 PIN/UV feature set (this build supports a minimal ClientPIN entry flow)
 // - Resident/discoverable credentials (rk)
 // - CTAP1/U2F (CTAPHID_MSG)
 // - Extensions and enterprise attestation
@@ -66,9 +66,18 @@
 #define USB_ENABLE_KBM_HID 0
 #endif
 
+// Development toggle:
+// - 1: require PIN for gated operations
+// - 0: disable PIN gate for easier testing
+#ifndef FIDO_REQUIRE_PIN
+#define FIDO_REQUIRE_PIN 0 // Disabled as per user request
+#endif
+
 static constexpr size_t   FIDO_HID_PACKET_SIZE = 64;
+// In composite keyboard/mouse mode, keep FIDO on its own report ID.
+// In FIDO-only mode, use report ID 0 (no report ID).
 #if USB_ENABLE_KBM_HID
-static constexpr uint8_t  FIDO_HID_REPORT_ID = HID_REPORT_ID_VENDOR;
+static constexpr uint8_t  FIDO_HID_REPORT_ID = HID_REPORT_ID_GAMEPAD;
 #else
 static constexpr uint8_t  FIDO_HID_REPORT_ID = HID_REPORT_ID_NONE;
 #endif
@@ -117,6 +126,10 @@ static constexpr uint8_t CTAP2_ERR_KEEPALIVE_CANCEL = 0x2D;
 static constexpr uint8_t CTAP2_ERR_NO_CREDENTIALS = 0x2E;
 static constexpr uint8_t CTAP2_ERR_USER_ACTION_TIMEOUT = 0x2F;
 static constexpr uint8_t CTAP2_ERR_NOT_ALLOWED = 0x30;
+static constexpr uint8_t CTAP2_ERR_PIN_INVALID = 0x31;
+static constexpr uint8_t CTAP2_ERR_PIN_BLOCKED = 0x32;
+static constexpr uint8_t CTAP2_ERR_PIN_AUTH_INVALID = 0x33;
+static constexpr uint8_t CTAP2_ERR_PIN_NOT_SET = 0x35;
 static constexpr uint8_t CTAP2_ERR_PIN_REQUIRED = 0x36;
 static constexpr uint8_t CTAP2_ERR_REQUEST_TOO_LARGE = 0x39;
 static constexpr uint8_t CTAP1_ERR_OTHER = 0x7F;
@@ -127,6 +140,23 @@ static constexpr uint8_t CTAP_CMD_GET_INFO = 0x04;
 static constexpr uint8_t CTAP_CMD_CLIENT_PIN = 0x06;
 static constexpr uint8_t CTAP_CMD_RESET = 0x07;
 static constexpr uint8_t CTAP_CMD_GET_NEXT_ASSERTION = 0x08;
+static constexpr uint8_t CTAP_CMD_BIO_ENROLLMENT = 0x09;
+static constexpr uint8_t CTAP_CMD_CREDENTIAL_MANAGEMENT = 0x0A;
+static constexpr uint8_t CTAP_CMD_SELECTION = 0x0B;
+static constexpr uint8_t CTAP_CMD_LARGE_BLOBS = 0x0C;
+static constexpr uint8_t CTAP_CMD_CONFIG = 0x0D;
+
+static constexpr uint8_t CTAP_CLIENT_PIN_GET_RETRIES = 0x01;
+static constexpr uint8_t CTAP_CLIENT_PIN_GET_KEY_AGREEMENT = 0x02;
+static constexpr uint8_t CTAP_CLIENT_PIN_SET_PIN = 0x03;
+static constexpr uint8_t CTAP_CLIENT_PIN_CHANGE_PIN = 0x04;
+static constexpr uint8_t CTAP_CLIENT_PIN_GET_PIN_TOKEN = 0x05;
+static constexpr uint8_t CTAP_CLIENT_PIN_GET_UV_RETRIES = 0x07;
+static constexpr uint8_t CTAP_CLIENT_PIN_GET_PIN_UV_AUTH_TOKEN_USING_PIN_WITH_PERMISSIONS = 0x09;
+static constexpr uint8_t CTAP_PIN_UV_AUTH_PROTOCOL_1 = 0x01;
+static constexpr size_t CTAP_PIN_HASH_ENC_LEN = 16;
+static constexpr size_t CTAP_PIN_UV_AUTH_PARAM_LEN = 16;
+static constexpr size_t CTAP_PIN_TOKEN_LEN = 32;
 
 static constexpr size_t FIDO_MAX_PAYLOAD = 1024;
 static constexpr uint32_t CTAP_UP_TIMEOUT_MS = 30 * 1000;
@@ -136,12 +166,14 @@ static constexpr uint32_t CTAP_KEEPALIVE_EVERY_MS = 100;
 // - 1: require BOOT button for user presence (stronger local-presence semantics)
 // - 0: auto-approve UP after a short delay (easier interoperability testing)
 #ifndef FIDO_REQUIRE_BOOT_BUTTON_FOR_UP
-#define FIDO_REQUIRE_BOOT_BUTTON_FOR_UP 1
+#define FIDO_REQUIRE_BOOT_BUTTON_FOR_UP 0 // Disabled as per user request
 #endif
-#if !FIDO_REQUIRE_BOOT_BUTTON_FOR_UP
-#error "Auto user-presence is disabled in this build; set FIDO_REQUIRE_BOOT_BUTTON_FOR_UP=1."
-#endif
+
+#if FIDO_REQUIRE_BOOT_BUTTON_FOR_UP
 static constexpr uint32_t CTAP_UP_MIN_HOLD_MS = 250;
+#else
+static constexpr uint32_t CTAP_UP_AUTO_APPROVE_MS = 250;
+#endif
 
 static constexpr uint8_t CTAP_CRED_SECRET_VER = 1;
 static constexpr uint8_t CTAP_CRED_FLAG_RK = 0x01;
@@ -156,6 +188,7 @@ static bool fidoAwaitingUserPresence = false;
 // Shared security policy hooks implemented in esp32s3-wifi-kbm.ino.
 bool security_pin_configured();
 bool security_pin_unlocked_now();
+bool security_fido_pin_hash16_get(uint8_t outHash16[16]);
 
 struct FidoDiagState {
   uint32_t lastCid = 0;
@@ -163,16 +196,40 @@ struct FidoDiagState {
   uint8_t lastCtapCmd = 0;
   uint8_t lastCtapStatus = 0;
   uint8_t lastHidError = 0;
+  uint8_t lastReportIdSeen = 0;
+  uint8_t lastReportIdDropped = 0;
+  uint16_t lastReportLenSeen = 0;
+  uint16_t lastReportLenDropped = 0;
   uint32_t totalCtapRequests = 0;
   uint32_t totalCtapOk = 0;
   uint32_t totalCtapErr = 0;
   uint32_t totalPinGateBlocks = 0;
   uint32_t totalUpSatisfied = 0;
+  uint32_t totalHidOutCallbacks = 0;
+  uint32_t totalHidSetFeatureCallbacks = 0;
+  uint32_t totalHidGetFeatureCallbacks = 0;
+  uint32_t totalUnexpectedReportId = 0;
+  uint32_t totalDroppedBadLen = 0;
+  uint32_t totalNormalizedPackets = 0;
   uint32_t lastRxMs = 0;
   uint32_t lastTxMs = 0;
 };
 
 static FidoDiagState fidoDiag;
+
+struct FidoClientPinState {
+  uint8_t keyAgreementPriv[32] = {0};
+  uint8_t keyAgreementX[32] = {0};
+  uint8_t keyAgreementY[32] = {0};
+  bool keyAgreementReady = false;
+  uint8_t pinUvAuthToken[CTAP_PIN_TOKEN_LEN] = {0};
+  uint8_t pinRetries = 8;
+};
+
+static FidoClientPinState fidoClientPin;
+
+static bool fido_client_pin_available();
+static bool fido_client_pin_hash_ready();
 
 static const char* ctaphid_cmd_name(const uint8_t cmd) {
   switch (cmd) {
@@ -207,6 +264,11 @@ static const char* ctap_cmd_name(const uint8_t cmd) {
     case CTAP_CMD_CLIENT_PIN: return "authenticatorClientPIN";
     case CTAP_CMD_RESET: return "authenticatorReset";
     case CTAP_CMD_GET_NEXT_ASSERTION: return "authenticatorGetNextAssertion";
+    case CTAP_CMD_BIO_ENROLLMENT: return "authenticatorBioEnrollment";
+    case CTAP_CMD_CREDENTIAL_MANAGEMENT: return "authenticatorCredentialManagement";
+    case CTAP_CMD_SELECTION: return "authenticatorSelection";
+    case CTAP_CMD_LARGE_BLOBS: return "authenticatorLargeBlobs";
+    case CTAP_CMD_CONFIG: return "authenticatorConfig";
     default: return "ctapUnknown";
   }
 }
@@ -234,6 +296,10 @@ static const char* ctap2_status_name(const uint8_t st) {
     case CTAP2_ERR_NO_CREDENTIALS: return "CTAP2_ERR_NO_CREDENTIALS";
     case CTAP2_ERR_USER_ACTION_TIMEOUT: return "CTAP2_ERR_USER_ACTION_TIMEOUT";
     case CTAP2_ERR_NOT_ALLOWED: return "CTAP2_ERR_NOT_ALLOWED";
+    case CTAP2_ERR_PIN_INVALID: return "CTAP2_ERR_PIN_INVALID";
+    case CTAP2_ERR_PIN_BLOCKED: return "CTAP2_ERR_PIN_BLOCKED";
+    case CTAP2_ERR_PIN_AUTH_INVALID: return "CTAP2_ERR_PIN_AUTH_INVALID";
+    case CTAP2_ERR_PIN_NOT_SET: return "CTAP2_ERR_PIN_NOT_SET";
     case CTAP2_ERR_PIN_REQUIRED: return "CTAP2_ERR_PIN_REQUIRED";
     case CTAP2_ERR_REQUEST_TOO_LARGE: return "CTAP2_ERR_REQUEST_TOO_LARGE";
     default: return "CTAP2_ERR_OTHER";
@@ -356,6 +422,332 @@ static bool ec_sign_der(const uint8_t priv[32], const uint8_t hash[32], uint8_t*
   if (sigLen > sigOutMax) return false;
   *sigLenOut = sigLen;
   return true;
+}
+
+static bool fido_ct_equal(const uint8_t* a, const uint8_t* b, const size_t len) {
+  if (!a || !b) return false;
+  uint8_t diff = 0;
+  for (size_t i = 0; i < len; ++i) diff |= static_cast<uint8_t>(a[i] ^ b[i]);
+  return diff == 0;
+}
+
+static bool fido_hmac_sha256(const uint8_t* key, const size_t keyLen, const uint8_t* msg, const size_t msgLen, uint8_t out[32]) {
+  if (!key || !msg || !out) return false;
+  const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (!info) return false;
+
+  mbedtls_md_context_t ctx;
+  mbedtls_md_init(&ctx);
+  int rc = mbedtls_md_setup(&ctx, info, 1);
+  if (rc == 0) rc = mbedtls_md_hmac_starts(&ctx, key, keyLen);
+  if (rc == 0) rc = mbedtls_md_hmac_update(&ctx, msg, msgLen);
+  if (rc == 0) rc = mbedtls_md_hmac_finish(&ctx, out);
+  mbedtls_md_free(&ctx);
+  return rc == 0;
+}
+
+static bool fido_aes256_cbc_crypt(const uint8_t key[32], const bool encrypt, const uint8_t* in, const size_t len, uint8_t* out) {
+  if (!key || !in || !out) return false;
+  if (len == 0 || (len % 16U) != 0U) return false;
+
+  mbedtls_aes_context aes;
+  mbedtls_aes_init(&aes);
+  uint8_t iv[16] = {0};
+  int rc = encrypt ? mbedtls_aes_setkey_enc(&aes, key, 256) : mbedtls_aes_setkey_dec(&aes, key, 256);
+  if (rc == 0) {
+    rc = mbedtls_aes_crypt_cbc(&aes, encrypt ? MBEDTLS_AES_ENCRYPT : MBEDTLS_AES_DECRYPT, len, iv, in, out);
+  }
+  mbedtls_aes_free(&aes);
+  return rc == 0;
+}
+
+static bool fido_client_pin_prepare_key_agreement() {
+  EcKeyPair kp;
+  if (!ec_generate(&kp)) return false;
+  memcpy(fidoClientPin.keyAgreementPriv, kp.priv, sizeof(fidoClientPin.keyAgreementPriv));
+  memcpy(fidoClientPin.keyAgreementX, kp.x, sizeof(fidoClientPin.keyAgreementX));
+  memcpy(fidoClientPin.keyAgreementY, kp.y, sizeof(fidoClientPin.keyAgreementY));
+  fidoClientPin.keyAgreementReady = true;
+  return true;
+}
+
+static bool fido_client_pin_compute_shared_secret(const uint8_t peerX[32], const uint8_t peerY[32], uint8_t outSharedSecret[32]) {
+  if (!peerX || !peerY || !outSharedSecret) return false;
+  if (!fidoClientPin.keyAgreementReady && !fido_client_pin_prepare_key_agreement()) return false;
+
+  uint8_t peerPub[65] = {0};
+  peerPub[0] = 0x04;
+  memcpy(peerPub + 1, peerX, 32);
+  memcpy(peerPub + 33, peerY, 32);
+
+  mbedtls_ecp_group grp;
+  mbedtls_ecp_group_init(&grp);
+  mbedtls_mpi d;
+  mbedtls_mpi_init(&d);
+  mbedtls_ecp_point qPeer;
+  mbedtls_ecp_point_init(&qPeer);
+  mbedtls_mpi z;
+  mbedtls_mpi_init(&z);
+
+  int rc = mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1);
+  if (rc == 0) rc = mbedtls_mpi_read_binary(&d, fidoClientPin.keyAgreementPriv, sizeof(fidoClientPin.keyAgreementPriv));
+  if (rc == 0) rc = mbedtls_ecp_point_read_binary(&grp, &qPeer, peerPub, sizeof(peerPub));
+  if (rc == 0) rc = mbedtls_ecdh_compute_shared(&grp, &z, &qPeer, &d, mbedtls_rng, nullptr);
+
+  uint8_t zBytes[32] = {0};
+  if (rc == 0) rc = mbedtls_mpi_write_binary(&z, zBytes, sizeof(zBytes));
+  bool ok = false;
+  if (rc == 0) ok = sha256_ret(zBytes, sizeof(zBytes), outSharedSecret);
+
+  secure_zero(zBytes, sizeof(zBytes));
+  mbedtls_mpi_free(&z);
+  mbedtls_ecp_point_free(&qPeer);
+  mbedtls_mpi_free(&d);
+  mbedtls_ecp_group_free(&grp);
+  return ok;
+}
+
+static uint8_t fido_parse_cose_p256_pubkey(CborValue* value, uint8_t outX[32], uint8_t outY[32]) {
+  if (!value || !outX || !outY) return CTAP2_ERR_INVALID_PARAMETER;
+  if (!cbor_value_is_map(value)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
+
+  CborValue it;
+  if (cbor_value_enter_container(value, &it) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+  bool haveX = false;
+  bool haveY = false;
+  while (!cbor_value_at_end(&it)) {
+    int key = 0;
+    if (!cbor_value_is_integer(&it) || cbor_value_get_int(&it, &key) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+    if (cbor_value_advance(&it) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+    if (key == -2 || key == -3) {
+      if (!cbor_value_is_byte_string(&it)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
+      size_t n = 0;
+      if (cbor_value_calculate_string_length(&it, &n) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+      if (n != 32) return CTAP2_ERR_INVALID_LENGTH;
+      size_t copy = 32;
+      uint8_t* dst = (key == -2) ? outX : outY;
+      if (cbor_value_copy_byte_string(&it, dst, &copy, nullptr) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+      if (copy != 32) return CTAP2_ERR_INVALID_LENGTH;
+      if (key == -2) haveX = true;
+      else haveY = true;
+    }
+    if (cbor_value_advance(&it) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+  }
+  if (cbor_value_leave_container(value, &it) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+  if (!haveX || !haveY) return CTAP2_ERR_MISSING_PARAMETER;
+  return CTAP2_OK;
+}
+
+static bool fido_verify_pin_uv_auth_param(const uint8_t clientDataHash[32], const uint8_t pinUvAuthParam[16]) {
+  if (!clientDataHash || !pinUvAuthParam) return false;
+  uint8_t mac[32] = {0};
+  bool ok = false;
+
+  // Legacy CTAP2.0 path (getPINToken): token is treated as 16-byte key material.
+  if (fido_hmac_sha256(fidoClientPin.pinUvAuthToken, 16, clientDataHash, 32, mac) && fido_ct_equal(mac, pinUvAuthParam, 16)) {
+    ok = true;
+  }
+
+  // CTAP2.1-style path (token-with-permissions): token may be 32-byte key material.
+  if (!ok && fido_hmac_sha256(fidoClientPin.pinUvAuthToken, sizeof(fidoClientPin.pinUvAuthToken), clientDataHash, 32, mac) &&
+      fido_ct_equal(mac, pinUvAuthParam, 16)) {
+    ok = true;
+  }
+
+  secure_zero(mac, sizeof(mac));
+  return ok;
+}
+
+static uint8_t ctap2_client_pin(const uint8_t* req, const size_t reqLen, uint8_t* out, const size_t outMax, size_t* outLen) {
+  if (!req || !out || !outLen) return CTAP1_ERR_OTHER;
+  *outLen = 0;
+  if (reqLen == 0) return CTAP2_ERR_INVALID_LENGTH;
+
+  CborParser parser;
+  CborValue root;
+  if (cbor_parser_init(req, reqLen, 0, &parser, &root) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+  if (!cbor_value_is_map(&root)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
+
+  int pinUvAuthProtocol = 0;
+  int subCommand = 0;
+  bool haveSubCommand = false;
+  uint8_t peerX[32] = {0};
+  uint8_t peerY[32] = {0};
+  bool haveKeyAgreement = false;
+  uint8_t pinHashEnc[CTAP_PIN_HASH_ENC_LEN] = {0};
+  bool havePinHashEnc = false;
+  uint64_t permissions = 0;
+  bool havePermissions = false;
+
+  CborValue it;
+  if (cbor_value_enter_container(&root, &it) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+  while (!cbor_value_at_end(&it)) {
+    bool valueConsumedByLeave = false;
+    int k = 0;
+    if (!cbor_value_is_integer(&it) || cbor_value_get_int(&it, &k) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+    if (cbor_value_advance(&it) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+
+    if (k == 0x01) {
+      if (!cbor_value_is_integer(&it) || cbor_value_get_int(&it, &pinUvAuthProtocol) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+    } else if (k == 0x02) {
+      if (!cbor_value_is_integer(&it) || cbor_value_get_int(&it, &subCommand) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+      haveSubCommand = true;
+    } else if (k == 0x03) {
+      const uint8_t st = fido_parse_cose_p256_pubkey(&it, peerX, peerY);
+      if (st != CTAP2_OK) return st;
+      haveKeyAgreement = true;
+      valueConsumedByLeave = true;
+    } else if (k == 0x06) {
+      if (!cbor_value_is_byte_string(&it)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
+      size_t n = 0;
+      if (cbor_value_calculate_string_length(&it, &n) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+      if (n != CTAP_PIN_HASH_ENC_LEN) return CTAP2_ERR_INVALID_LENGTH;
+      size_t copy = sizeof(pinHashEnc);
+      if (cbor_value_copy_byte_string(&it, pinHashEnc, &copy, nullptr) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+      if (copy != sizeof(pinHashEnc)) return CTAP2_ERR_INVALID_LENGTH;
+      havePinHashEnc = true;
+    } else if (k == 0x09) {
+      if (!cbor_value_is_integer(&it)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
+      if (cbor_value_get_uint64(&it, &permissions) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+      havePermissions = true;
+    } else if (k == 0x0A) {
+      // rpId (optional for makeCredential/assertion permissions); accepted and ignored in this minimal flow.
+      if (!cbor_value_is_text_string(&it)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
+    }
+
+    if (!valueConsumedByLeave) {
+      if (cbor_value_advance(&it) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+    }
+  }
+  if (cbor_value_leave_container(&root, &it) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+  if (!haveSubCommand) return CTAP2_ERR_MISSING_PARAMETER;
+
+  if (subCommand == CTAP_CLIENT_PIN_GET_RETRIES) {
+    CborEncoder enc;
+    cbor_encoder_init(&enc, out, outMax, 0);
+    CborEncoder map;
+    if (cbor_encoder_create_map(&enc, &map, 1) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    if (cbor_encode_int(&map, 0x03) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    if (cbor_encode_uint(&map, fidoClientPin.pinRetries) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    if (cbor_encoder_close_container(&enc, &map) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    *outLen = cbor_encoder_get_buffer_size(&enc, out);
+    return CTAP2_OK;
+  }
+
+  if (subCommand == CTAP_CLIENT_PIN_GET_UV_RETRIES) {
+    CborEncoder enc;
+    cbor_encoder_init(&enc, out, outMax, 0);
+    CborEncoder map;
+    if (cbor_encoder_create_map(&enc, &map, 1) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    if (cbor_encode_int(&map, 0x05) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    if (cbor_encode_uint(&map, 0) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    if (cbor_encoder_close_container(&enc, &map) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    *outLen = cbor_encoder_get_buffer_size(&enc, out);
+    return CTAP2_OK;
+  }
+
+  if (subCommand == CTAP_CLIENT_PIN_GET_KEY_AGREEMENT) {
+    if (!fido_client_pin_prepare_key_agreement()) return CTAP2_ERR_PROCESSING;
+    CborEncoder enc;
+    cbor_encoder_init(&enc, out, outMax, 0);
+    CborEncoder map;
+    if (cbor_encoder_create_map(&enc, &map, 1) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    if (cbor_encode_int(&map, 0x01) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    CborEncoder ka;
+    if (cbor_encoder_create_map(&map, &ka, 5) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    if (cbor_encode_int(&ka, 1) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    if (cbor_encode_int(&ka, 2) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    if (cbor_encode_int(&ka, 3) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    if (cbor_encode_int(&ka, -25) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    if (cbor_encode_int(&ka, -1) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    if (cbor_encode_int(&ka, 1) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    if (cbor_encode_int(&ka, -2) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    if (cbor_encode_byte_string(&ka, fidoClientPin.keyAgreementX, sizeof(fidoClientPin.keyAgreementX)) != CborNoError)
+      return CTAP2_ERR_CBOR_PARSING;
+    if (cbor_encode_int(&ka, -3) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    if (cbor_encode_byte_string(&ka, fidoClientPin.keyAgreementY, sizeof(fidoClientPin.keyAgreementY)) != CborNoError)
+      return CTAP2_ERR_CBOR_PARSING;
+    if (cbor_encoder_close_container(&map, &ka) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    if (cbor_encoder_close_container(&enc, &map) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    *outLen = cbor_encoder_get_buffer_size(&enc, out);
+    return CTAP2_OK;
+  }
+
+  if (subCommand == CTAP_CLIENT_PIN_GET_PIN_TOKEN || subCommand == CTAP_CLIENT_PIN_GET_PIN_UV_AUTH_TOKEN_USING_PIN_WITH_PERMISSIONS) {
+    if (!security_pin_configured()) return CTAP2_ERR_PIN_NOT_SET;
+    if (pinUvAuthProtocol != CTAP_PIN_UV_AUTH_PROTOCOL_1) return CTAP2_ERR_INVALID_PARAMETER;
+    if (!haveKeyAgreement || !havePinHashEnc) return CTAP2_ERR_MISSING_PARAMETER;
+    if (subCommand == CTAP_CLIENT_PIN_GET_PIN_UV_AUTH_TOKEN_USING_PIN_WITH_PERMISSIONS && !havePermissions)
+      return CTAP2_ERR_MISSING_PARAMETER;
+    if (fidoClientPin.pinRetries == 0) return CTAP2_ERR_PIN_BLOCKED;
+    if (!fido_client_pin_hash_ready()) return CTAP2_ERR_PIN_NOT_SET;
+
+    uint8_t expectedHash16[16] = {0};
+    if (!security_fido_pin_hash16_get(expectedHash16)) return CTAP2_ERR_PIN_NOT_SET;
+
+    uint8_t sharedSecret[32] = {0};
+    if (!fido_client_pin_compute_shared_secret(peerX, peerY, sharedSecret)) {
+      secure_zero(expectedHash16, sizeof(expectedHash16));
+      return CTAP2_ERR_PROCESSING;
+    }
+
+    uint8_t pinHashPlain[16] = {0};
+    const bool decOk = fido_aes256_cbc_crypt(sharedSecret, false, pinHashEnc, sizeof(pinHashEnc), pinHashPlain);
+    if (!decOk || !fido_ct_equal(pinHashPlain, expectedHash16, sizeof(pinHashPlain))) {
+      if (fidoClientPin.pinRetries > 0) fidoClientPin.pinRetries--;
+      const uint8_t st = (fidoClientPin.pinRetries == 0) ? CTAP2_ERR_PIN_BLOCKED : CTAP2_ERR_PIN_INVALID;
+      secure_zero(sharedSecret, sizeof(sharedSecret));
+      secure_zero(pinHashPlain, sizeof(pinHashPlain));
+      secure_zero(expectedHash16, sizeof(expectedHash16));
+      return st;
+    }
+
+    fidoClientPin.pinRetries = 8;
+    const size_t tokenOutLen =
+      (subCommand == CTAP_CLIENT_PIN_GET_PIN_TOKEN) ? static_cast<size_t>(16) : static_cast<size_t>(CTAP_PIN_TOKEN_LEN);
+    uint8_t pinTokenEnc[CTAP_PIN_TOKEN_LEN] = {0};
+    if (!fido_aes256_cbc_crypt(sharedSecret, true, fidoClientPin.pinUvAuthToken, tokenOutLen, pinTokenEnc)) {
+      secure_zero(sharedSecret, sizeof(sharedSecret));
+      secure_zero(pinHashPlain, sizeof(pinHashPlain));
+      secure_zero(expectedHash16, sizeof(expectedHash16));
+      secure_zero(pinTokenEnc, sizeof(pinTokenEnc));
+      return CTAP2_ERR_PROCESSING;
+    }
+
+    CborEncoder enc;
+    cbor_encoder_init(&enc, out, outMax, 0);
+    CborEncoder map;
+    if (cbor_encoder_create_map(&enc, &map, 1) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    if (cbor_encode_int(&map, 0x02) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    if (cbor_encode_byte_string(&map, pinTokenEnc, tokenOutLen) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    if (cbor_encoder_close_container(&enc, &map) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    *outLen = cbor_encoder_get_buffer_size(&enc, out);
+
+    secure_zero(sharedSecret, sizeof(sharedSecret));
+    secure_zero(pinHashPlain, sizeof(pinHashPlain));
+    secure_zero(expectedHash16, sizeof(expectedHash16));
+    secure_zero(pinTokenEnc, sizeof(pinTokenEnc));
+    return CTAP2_OK;
+  }
+
+  if (subCommand == CTAP_CLIENT_PIN_SET_PIN || subCommand == CTAP_CLIENT_PIN_CHANGE_PIN) {
+    // PIN provisioning is done through /hsm web UI; ClientPIN currently supports entry flow only.
+    return CTAP2_ERR_NOT_ALLOWED;
+  }
+
+  // Some hosts probe additional ClientPIN subcommands; respond softly.
+  return CTAP2_ERR_NOT_ALLOWED;
+}
+
+static bool fido_client_pin_available() {
+  return security_pin_configured();
+}
+
+static bool fido_client_pin_hash_ready() {
+  uint8_t h[16] = {0};
+  const bool ok = security_fido_pin_hash16_get(h);
+  secure_zero(h, sizeof(h));
+  return ok;
 }
 
 static bool build_cred_secret(const bool rk, const uint8_t* user, const size_t userLen, const uint8_t priv[32], uint8_t* out,
@@ -817,13 +1209,20 @@ static uint8_t ctap2_parse_pubkey_cred_descriptor(CborValue* descMap, uint8_t* i
 static uint8_t ctap2_get_info(uint8_t* out, const size_t outMax, size_t* outLen) {
   if (!out || !outLen) return CTAP1_ERR_OTHER;
   *outLen = 0;
+  const bool clientPin = fido_client_pin_available();
+  const size_t mapPairs = clientPin ? 5 : 4;
   CborEncoder enc;
   cbor_encoder_init(&enc, out, outMax, 0);
 
   // Keep getInfo compact enough to fit a single CTAPHID frame.
-  // Map keys: 0x01 versions, 0x03 aaguid, 0x04 options, 0x05 maxMsgSize
+  // Map keys:
+  // - 0x01 versions
+  // - 0x03 aaguid
+  // - 0x04 options
+  // - 0x05 maxMsgSize
+  // - 0x06 pinUvAuthProtocols (when clientPin is configured)
   CborEncoder map;
-  if (cbor_encoder_create_map(&enc, &map, 4) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+  if (cbor_encoder_create_map(&enc, &map, mapPairs) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
 
   // versions
   if (cbor_encode_int(&map, 0x01) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
@@ -842,15 +1241,24 @@ static uint8_t ctap2_get_info(uint8_t* out, const size_t outMax, size_t* outLen)
   if (cbor_encoder_create_map(&map, &opt, 3) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
   if (cbor_encode_text_stringz(&opt, "up") != CborNoError) return CTAP2_ERR_CBOR_PARSING;
   if (cbor_encode_boolean(&opt, true) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
-  if (cbor_encode_text_stringz(&opt, "uv") != CborNoError) return CTAP2_ERR_CBOR_PARSING;
-  if (cbor_encode_boolean(&opt, false) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
   if (cbor_encode_text_stringz(&opt, "rk") != CborNoError) return CTAP2_ERR_CBOR_PARSING;
   if (cbor_encode_boolean(&opt, true) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+  if (cbor_encode_text_stringz(&opt, "clientPin") != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+  if (cbor_encode_boolean(&opt, clientPin) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
   if (cbor_encoder_close_container(&map, &opt) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
 
   // maxMsgSize
   if (cbor_encode_int(&map, 0x05) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
   if (cbor_encode_uint(&map, FIDO_MAX_PAYLOAD) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+
+  if (clientPin) {
+    // pinUvAuthProtocols = [1]
+    if (cbor_encode_int(&map, 0x06) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    CborEncoder prots;
+    if (cbor_encoder_create_array(&map, &prots, 1) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    if (cbor_encode_uint(&prots, CTAP_PIN_UV_AUTH_PROTOCOL_1) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+    if (cbor_encoder_close_container(&map, &prots) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+  }
 
   if (cbor_encoder_close_container(&enc, &map) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
   *outLen = cbor_encoder_get_buffer_size(&enc, out);
@@ -896,6 +1304,16 @@ static uint8_t ctap2_make_credential(const uint8_t* req, const size_t reqLen, ui
   bool optionRk = false;
   bool optionUv = false;
   bool excludeHit = false;
+#if FIDO_REQUIRE_PIN
+  const bool pinGate = security_pin_configured() && !security_pin_unlocked_now();
+#else
+  const bool pinGate = false;
+#endif
+  bool pinAuthSatisfied = false;
+  uint8_t pinUvAuthParam[CTAP_PIN_UV_AUTH_PARAM_LEN] = {0};
+  bool havePinUvAuthParam = false;
+  int pinUvAuthProtocol = 0;
+  bool havePinUvAuthProtocol = false;
 
   CborValue it;
   if (cbor_value_enter_container(&root, &it) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
@@ -911,7 +1329,7 @@ static uint8_t ctap2_make_credential(const uint8_t* req, const size_t reqLen, ui
     FIDO_LOG("makeCredential: key=%d", k);
 
 #if FIDO_STABILITY_MINIMAL_MAKECRED_PARSE
-    if (haveClientHash && haveRpId && (k != 0x01) && (k != 0x02)) {
+    if (!pinGate && haveClientHash && haveRpId && (k != 0x01) && (k != 0x02)) {
       // Stop after the required fields to avoid unstable deep-map traversal paths.
       FIDO_LOG("makeCredential: minimal parse early exit at key=%d", k);
       minimalParsedEnough = true;
@@ -1083,9 +1501,18 @@ static uint8_t ctap2_make_credential(const uint8_t* req, const size_t reqLen, ui
       valueConsumedByLeave = true;
       FIDO_LOG("makeCredential: key 0x07 ok rk=%u uv=%u", static_cast<unsigned>(optionRk), static_cast<unsigned>(optionUv));
 #endif
-    } else if (k == 0x08 || k == 0x09) {
-      // pinUvAuthParam / pinUvAuthProtocol present -> not supported
-      return CTAP2_ERR_PIN_REQUIRED;
+    } else if (k == 0x08) {
+      if (!cbor_value_is_byte_string(&it)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
+      size_t n = 0;
+      if (cbor_value_calculate_string_length(&it, &n) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+      if (n != CTAP_PIN_UV_AUTH_PARAM_LEN) return CTAP2_ERR_INVALID_LENGTH;
+      size_t copy = sizeof(pinUvAuthParam);
+      if (cbor_value_copy_byte_string(&it, pinUvAuthParam, &copy, nullptr) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+      if (copy != sizeof(pinUvAuthParam)) return CTAP2_ERR_INVALID_LENGTH;
+      havePinUvAuthParam = true;
+    } else if (k == 0x09) {
+      if (!cbor_value_is_integer(&it) || cbor_value_get_int(&it, &pinUvAuthProtocol) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+      havePinUvAuthProtocol = true;
     }
 
     if (!valueConsumedByLeave) {
@@ -1108,6 +1535,14 @@ static uint8_t ctap2_make_credential(const uint8_t* req, const size_t reqLen, ui
   if (!haveClientHash || !haveRpId || !haveUser) return CTAP2_ERR_MISSING_PARAMETER;
   if (!haveAlg) return CTAP2_ERR_UNSUPPORTED_ALGORITHM;
   if (optionUv) return CTAP2_ERR_UNSUPPORTED_OPTION;
+  if (pinGate) {
+    if (!fido_client_pin_available()) return CTAP2_ERR_PIN_NOT_SET;
+    if (!fido_client_pin_hash_ready()) return CTAP2_ERR_PIN_NOT_SET;
+    if (!havePinUvAuthParam || !havePinUvAuthProtocol) return CTAP2_ERR_PIN_REQUIRED;
+    if (pinUvAuthProtocol != CTAP_PIN_UV_AUTH_PROTOCOL_1) return CTAP2_ERR_PIN_AUTH_INVALID;
+    if (!fido_verify_pin_uv_auth_param(clientDataHash, pinUvAuthParam)) return CTAP2_ERR_PIN_AUTH_INVALID;
+    pinAuthSatisfied = true;
+  }
   FIDO_LOG("makeCredential: parsed rpId=%s userIdLen=%u optionRk=%u", rpId, static_cast<unsigned>(userIdLen),
            static_cast<unsigned>(optionRk));
 
@@ -1172,7 +1607,7 @@ static uint8_t ctap2_make_credential(const uint8_t* req, const size_t reqLen, ui
   size_t authLen = 0;
   memcpy(authData + authLen, rpIdHash, 32);
   authLen += 32;
-  const uint8_t flags = 0x01 /*UP*/ | 0x40 /*AT*/;
+  const uint8_t flags = 0x01 /*UP*/ | (pinAuthSatisfied ? 0x04 : 0x00) /*UV*/ | 0x40 /*AT*/;
   authData[authLen++] = flags;
   write_be_u32(authData + authLen, fidoSignCount);
   authLen += 4;
@@ -1253,6 +1688,16 @@ static uint8_t ctap2_get_assertion(const uint8_t* req, const size_t reqLen, uint
   uint8_t clientDataHash[32] = {0};
   bool haveClientHash = false;
   bool optionUv = false;
+#if FIDO_REQUIRE_PIN
+  const bool pinGate = security_pin_configured() && !security_pin_unlocked_now();
+#else
+  const bool pinGate = false;
+#endif
+  bool pinAuthSatisfied = false;
+  uint8_t pinUvAuthParam[CTAP_PIN_UV_AUTH_PARAM_LEN] = {0};
+  bool havePinUvAuthParam = false;
+  int pinUvAuthProtocol = 0;
+  bool havePinUvAuthProtocol = false;
 
   // allowList required in this minimal implementation (non-discoverable credentials)
   static constexpr size_t kMaxAllowCreds = 8;
@@ -1279,7 +1724,7 @@ static uint8_t ctap2_get_assertion(const uint8_t* req, const size_t reqLen, uint
     FIDO_LOG("getAssertion: key=%d", k);
 
 #if FIDO_STABILITY_MINIMAL_MAKECRED_PARSE
-    if (haveRpId && haveClientHash && (k != 0x01) && (k != 0x02)) {
+    if (!pinGate && haveRpId && haveClientHash && (k != 0x01) && (k != 0x02)) {
       FIDO_LOG("getAssertion: minimal parse early exit at key=%d", k);
       minimalParsedEnough = true;
       break;
@@ -1355,9 +1800,18 @@ static uint8_t ctap2_get_assertion(const uint8_t* req, const size_t reqLen, uint
       if (cbor_value_leave_container(&it, &oIt) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
       valueConsumedByLeave = true;
       FIDO_LOG("getAssertion: key 0x05 options uv=%u", static_cast<unsigned>(optionUv));
-    } else if (k == 0x06 || k == 0x07) {
-      // pinUvAuthParam / pinUvAuthProtocol present -> not supported
-      return CTAP2_ERR_PIN_REQUIRED;
+    } else if (k == 0x06) {
+      if (!cbor_value_is_byte_string(&it)) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
+      size_t n = 0;
+      if (cbor_value_calculate_string_length(&it, &n) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+      if (n != CTAP_PIN_UV_AUTH_PARAM_LEN) return CTAP2_ERR_INVALID_LENGTH;
+      size_t copy = sizeof(pinUvAuthParam);
+      if (cbor_value_copy_byte_string(&it, pinUvAuthParam, &copy, nullptr) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+      if (copy != sizeof(pinUvAuthParam)) return CTAP2_ERR_INVALID_LENGTH;
+      havePinUvAuthParam = true;
+    } else if (k == 0x07) {
+      if (!cbor_value_is_integer(&it) || cbor_value_get_int(&it, &pinUvAuthProtocol) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
+      havePinUvAuthProtocol = true;
     }
 
     if (!valueConsumedByLeave) {
@@ -1374,6 +1828,14 @@ static uint8_t ctap2_get_assertion(const uint8_t* req, const size_t reqLen, uint
 
   if (!haveRpId || !haveClientHash) return CTAP2_ERR_MISSING_PARAMETER;
   if (optionUv) return CTAP2_ERR_UNSUPPORTED_OPTION;
+  if (pinGate) {
+    if (!fido_client_pin_available()) return CTAP2_ERR_PIN_NOT_SET;
+    if (!fido_client_pin_hash_ready()) return CTAP2_ERR_PIN_NOT_SET;
+    if (!havePinUvAuthParam || !havePinUvAuthProtocol) return CTAP2_ERR_PIN_REQUIRED;
+    if (pinUvAuthProtocol != CTAP_PIN_UV_AUTH_PROTOCOL_1) return CTAP2_ERR_PIN_AUTH_INVALID;
+    if (!fido_verify_pin_uv_auth_param(clientDataHash, pinUvAuthParam)) return CTAP2_ERR_PIN_AUTH_INVALID;
+    pinAuthSatisfied = true;
+  }
   for (size_t i = 0; i < allowCredCount && !haveCred; ++i) {
     char storedRp[CRED_MAX_RPID_LEN + 1];
     uint8_t secret[CRED_MAX_SECRET_LEN];
@@ -1419,7 +1881,7 @@ static uint8_t ctap2_get_assertion(const uint8_t* req, const size_t reqLen, uint
 
   uint8_t authData[37];
   memcpy(authData + 0, rpIdHash, 32);
-  authData[32] = 0x01; // UP
+  authData[32] = static_cast<uint8_t>(0x01U | (pinAuthSatisfied ? 0x04U : 0x00U)); // UP + optional UV
   write_be_u32(authData + 33, fidoSignCount);
 
   // Signature over authData || clientDataHash
@@ -1466,11 +1928,35 @@ static uint8_t ctap2_reset() {
   return CTAP2_OK;
 }
 
+// FIDO descriptor with explicit FEATURE report support.
+// Some Windows CTAP paths probe/report via HID feature transactions.
+static const uint8_t fido_report_descriptor[] = {
+  HID_USAGE_PAGE_N(HID_USAGE_PAGE_FIDO, 2),
+  HID_USAGE(HID_USAGE_FIDO_U2FHID),
+  HID_COLLECTION(HID_COLLECTION_APPLICATION),
 #if USB_ENABLE_KBM_HID
-static const uint8_t fido_report_descriptor[] = {TUD_HID_REPORT_DESC_FIDO_U2F(FIDO_HID_PACKET_SIZE, HID_REPORT_ID(FIDO_HID_REPORT_ID))};
-#else
-static const uint8_t fido_report_descriptor[] = {TUD_HID_REPORT_DESC_FIDO_U2F(FIDO_HID_PACKET_SIZE)};
+    HID_REPORT_ID(FIDO_HID_REPORT_ID)
 #endif
+    HID_USAGE(HID_USAGE_FIDO_DATA_IN),
+    HID_LOGICAL_MIN(0),
+    HID_LOGICAL_MAX_N(0xFF, 2),
+    HID_REPORT_SIZE(8),
+    HID_REPORT_COUNT(FIDO_HID_PACKET_SIZE),
+    HID_INPUT(HID_DATA | HID_VARIABLE | HID_ABSOLUTE),
+    HID_USAGE(HID_USAGE_FIDO_DATA_OUT),
+    HID_LOGICAL_MIN(0),
+    HID_LOGICAL_MAX_N(0xFF, 2),
+    HID_REPORT_SIZE(8),
+    HID_REPORT_COUNT(FIDO_HID_PACKET_SIZE),
+    HID_OUTPUT(HID_DATA | HID_VARIABLE | HID_ABSOLUTE),
+    HID_USAGE(HID_USAGE_FIDO_DATA_OUT),
+    HID_LOGICAL_MIN(0),
+    HID_LOGICAL_MAX_N(0xFF, 2),
+    HID_REPORT_SIZE(8),
+    HID_REPORT_COUNT(FIDO_HID_PACKET_SIZE),
+    HID_FEATURE(HID_DATA | HID_VARIABLE | HID_ABSOLUTE),
+  HID_COLLECTION_END
+};
 
 struct FidoRxState {
   bool active = false;
@@ -1565,33 +2051,37 @@ private:
 
   void dispatchNormalizedPacket(const uint8_t* pkt64) {
     if (!pkt64) return;
+    fidoDiag.totalNormalizedPackets++;
     fido_hid_on_packet(pkt64, FIDO_HID_PACKET_SIZE);
   }
 
   void handleIncomingReport(uint8_t report_id, const uint8_t* buffer, uint16_t lenBytes) {
     if (!buffer) return;
+    fidoDiag.lastReportIdSeen = report_id;
+    fidoDiag.lastReportLenSeen = lenBytes;
     const bool noReportIdMode = (FIDO_HID_REPORT_ID == HID_REPORT_ID_NONE);
-    if (!noReportIdMode && report_id != 0 && report_id != FIDO_HID_REPORT_ID) return;
+    if (!noReportIdMode && report_id != 0 && report_id != FIDO_HID_REPORT_ID) {
+      // Keep parsing anyway: some host paths surface an unexpected report ID even
+      // though payload bytes are valid CTAPHID packets.
+      fidoDiag.totalUnexpectedReportId++;
+      fidoDiag.lastReportIdDropped = report_id;
+    }
 
     if (lenBytes == FIDO_HID_PACKET_SIZE) {
       dispatchNormalizedPacket(buffer);
       return;
     }
 
-    // Some host paths deliver 65-byte reports with a leading report-ID byte.
+    // Most host paths deliver 65-byte reports with a leading report-ID byte.
+    // Always normalize by stripping that first byte to avoid misaligned CTAPHID.
     if (lenBytes == (FIDO_HID_PACKET_SIZE + 1)) {
-      if (noReportIdMode) {
-        // In no-report-ID descriptor mode, host APIs still prepend report-id 0.
-        dispatchNormalizedPacket(buffer + 1);
-      } else if (buffer[0] == 0 || buffer[0] == FIDO_HID_REPORT_ID) {
-        dispatchNormalizedPacket(buffer + 1);
-      } else {
-        dispatchNormalizedPacket(buffer);
-      }
+      (void)noReportIdMode;
+      dispatchNormalizedPacket(buffer + 1);
       return;
     }
 
-    fido_hid_on_packet(buffer, lenBytes);
+    fidoDiag.totalDroppedBadLen++;
+    fidoDiag.lastReportLenDropped = lenBytes;
   }
 
 public:
@@ -1624,8 +2114,15 @@ public:
 
   uint16_t _onGetFeature(uint8_t report_id, uint8_t* buffer, uint16_t lenBytes) override {
     if (!buffer) return 0;
+    fidoDiag.totalHidGetFeatureCallbacks++;
+    fidoDiag.lastReportIdSeen = report_id;
+    fidoDiag.lastReportLenSeen = lenBytes;
     const bool noReportIdMode = (FIDO_HID_REPORT_ID == HID_REPORT_ID_NONE);
-    if (!noReportIdMode && report_id != 0 && report_id != FIDO_HID_REPORT_ID) return 0;
+    if (!noReportIdMode && report_id != 0 && report_id != FIDO_HID_REPORT_ID) {
+      // Accept anyway for compatibility; we still emit a valid FIDO frame.
+      fidoDiag.totalUnexpectedReportId++;
+      fidoDiag.lastReportIdDropped = report_id;
+    }
 
     uint8_t pkt[FIDO_HID_PACKET_SIZE];
     if (!popFeaturePacket(pkt)) {
@@ -1663,6 +2160,12 @@ public:
     }
 
     if (noReportIdMode) {
+      // Some host APIs still allocate an extra leading byte for report-id 0.
+      if (lenBytes >= (FIDO_HID_PACKET_SIZE + 1U)) {
+        buffer[0] = 0;
+        memcpy(buffer + 1, pkt, FIDO_HID_PACKET_SIZE);
+        return static_cast<uint16_t>(FIDO_HID_PACKET_SIZE + 1U);
+      }
       if (lenBytes >= FIDO_HID_PACKET_SIZE) {
         memcpy(buffer, pkt, FIDO_HID_PACKET_SIZE);
         return FIDO_HID_PACKET_SIZE;
@@ -1672,7 +2175,8 @@ public:
     }
 
     if (lenBytes >= (FIDO_HID_PACKET_SIZE + 1U)) {
-      buffer[0] = FIDO_HID_REPORT_ID;
+      const uint8_t outReportId = (report_id != 0) ? report_id : FIDO_HID_REPORT_ID;
+      buffer[0] = outReportId;
       memcpy(buffer + 1, pkt, FIDO_HID_PACKET_SIZE);
       return static_cast<uint16_t>(FIDO_HID_PACKET_SIZE + 1U);
     }
@@ -1685,19 +2189,15 @@ public:
   }
 
   void _onOutput(uint8_t report_id, const uint8_t* buffer, uint16_t lenBytes) override {
+    fidoDiag.totalHidOutCallbacks++;
     handleIncomingReport(report_id, buffer, lenBytes);
   }
 
   void _onSetFeature(uint8_t report_id, const uint8_t* buffer, uint16_t lenBytes) override {
     // ESP32 Arduino's TinyUSB shim can route report-id traffic via SetFeature.
     // Handle it the same way so CTAPHID packets are not dropped on Windows.
-    const bool noReportIdMode = (FIDO_HID_REPORT_ID == HID_REPORT_ID_NONE);
+    fidoDiag.totalHidSetFeatureCallbacks++;
     handleIncomingReport(report_id, buffer, lenBytes);
-    if (!noReportIdMode && report_id != 0 && report_id != FIDO_HID_REPORT_ID) {
-      // Some host paths can surface feature packets with an unexpected report_id.
-      // Retry as report_id 0 so raw 64-byte CTAPHID frames are still parsed.
-      handleIncomingReport(0, buffer, lenBytes);
-    }
   }
 };
 
@@ -1946,7 +2446,23 @@ static void fido_handle_cbor(const uint32_t cid, const uint8_t* data, const size
   }
 
   if (ctapCmd == CTAP_CMD_CLIENT_PIN) {
-    fido_send_ctap2_status(cid, CTAP2_ERR_PIN_REQUIRED, nullptr, 0);
+    uint8_t body[256];
+    size_t bodyLen = 0;
+    const uint8_t st = ctap2_client_pin(payload, payloadLen, body, sizeof(body), &bodyLen);
+    fido_send_ctap2_status(cid, st, body, bodyLen);
+    return;
+  }
+
+  if (ctapCmd == CTAP_CMD_SELECTION) {
+    // Selection is a no-op for this device but should succeed.
+    fido_send_ctap2_status(cid, CTAP2_OK, nullptr, 0);
+    return;
+  }
+
+  if (ctapCmd == CTAP_CMD_BIO_ENROLLMENT || ctapCmd == CTAP_CMD_CREDENTIAL_MANAGEMENT || ctapCmd == CTAP_CMD_LARGE_BLOBS ||
+      ctapCmd == CTAP_CMD_CONFIG) {
+    // Explicitly report not-allowed instead of invalid-command to improve host compatibility.
+    fido_send_ctap2_status(cid, CTAP2_ERR_NOT_ALLOWED, nullptr, 0);
     return;
   }
 
@@ -1955,14 +2471,16 @@ static void fido_handle_cbor(const uint32_t cid, const uint8_t* data, const size
     return;
   }
 
-  if (ctapCmd == CTAP_CMD_MAKE_CREDENTIAL || ctapCmd == CTAP_CMD_GET_ASSERTION || ctapCmd == CTAP_CMD_RESET) {
-    // Enforce PIN only when the device PIN is configured.
+  if (ctapCmd == CTAP_CMD_RESET) {
+#if FIDO_REQUIRE_PIN
+    // Reset has no pinUvAuthParam field in this implementation; require local unlock window if PIN is configured.
     if (security_pin_configured() && !security_pin_unlocked_now()) {
       fidoDiag.totalPinGateBlocks++;
       FIDO_LOG("Security PIN gate blocked cmd=%s", ctap_cmd_name(ctapCmd));
       fido_send_ctap2_status(cid, CTAP2_ERR_PIN_REQUIRED, nullptr, 0);
       return;
     }
+#endif
   }
 
   if (ctapCmd == CTAP_CMD_MAKE_CREDENTIAL) {
@@ -1978,7 +2496,8 @@ static void fido_handle_cbor(const uint32_t cid, const uint8_t* data, const size
     return;
   }
 
-  fido_send_ctap2_status(cid, CTAP2_ERR_INVALID_COMMAND, nullptr, 0);
+  // For unsupported CTAP commands, prefer NOT_ALLOWED over INVALID_COMMAND for host compatibility.
+  fido_send_ctap2_status(cid, CTAP2_ERR_NOT_ALLOWED, nullptr, 0);
 }
 
 static void fido_process_request() {
@@ -2018,7 +2537,7 @@ static void fido_tick_pending() {
   const uint32_t now = millis();
   const uint32_t cid = pendingCtap.cid;
   bool upSatisfied = false;
-
+ 
   if (static_cast<int32_t>(now - pendingCtap.startedMs) > static_cast<int32_t>(CTAP_UP_TIMEOUT_MS)) {
     pendingCtap.active = false;
     fidoAwaitingUserPresence = false;
@@ -2026,12 +2545,12 @@ static void fido_tick_pending() {
     fido_send_ctap2_status(cid, CTAP2_ERR_USER_ACTION_TIMEOUT, nullptr, 0);
     return;
   }
-
+#if FIDO_REQUIRE_BOOT_BUTTON_FOR_UP
   if (static_cast<int32_t>(now - pendingCtap.lastKeepaliveMs) >= static_cast<int32_t>(CTAP_KEEPALIVE_EVERY_MS)) {
     pendingCtap.lastKeepaliveMs = now;
     fido_send_keepalive(cid, CTAPHID_KEEPALIVE_STATUS_UP_NEEDED);
   }
-
+ 
   const bool down = boot_button_down();
   if (!pendingCtap.sawButtonRelease) {
     // Require at least one release edge after request start so a stuck-low line
@@ -2042,13 +2561,21 @@ static void fido_tick_pending() {
     }
     return;
   }
-
+ 
   if (down) {
     if (pendingCtap.buttonDownSinceMs == 0) pendingCtap.buttonDownSinceMs = now;
     upSatisfied = static_cast<int32_t>(now - pendingCtap.buttonDownSinceMs) >= static_cast<int32_t>(CTAP_UP_MIN_HOLD_MS);
   } else {
     pendingCtap.buttonDownSinceMs = 0;
   }
+#else  // !FIDO_REQUIRE_BOOT_BUTTON_FOR_UP
+  if (static_cast<int32_t>(now - pendingCtap.lastKeepaliveMs) >= static_cast<int32_t>(CTAP_KEEPALIVE_EVERY_MS)) {
+    pendingCtap.lastKeepaliveMs = now;
+    fido_send_keepalive(cid, CTAPHID_KEEPALIVE_STATUS_PROCESSING);
+  }
+  upSatisfied = static_cast<int32_t>(now - pendingCtap.startedMs) >= static_cast<int32_t>(CTAP_UP_AUTO_APPROVE_MS);
+#endif
+ 
   if (!upSatisfied) return;
   fidoDiag.totalUpSatisfied++;
   FIDO_LOG("User presence satisfied cid=%08lX", static_cast<unsigned long>(cid));
@@ -2087,6 +2614,12 @@ void fido_begin() {
   fidoHid.clearQueue();
   fido_diag_clear();
   runtime_cred_clear();
+  esp_fill_random(fidoClientPin.pinUvAuthToken, sizeof(fidoClientPin.pinUvAuthToken));
+  fidoClientPin.pinRetries = 8;
+  fidoClientPin.keyAgreementReady = false;
+  secure_zero(fidoClientPin.keyAgreementPriv, sizeof(fidoClientPin.keyAgreementPriv));
+  secure_zero(fidoClientPin.keyAgreementX, sizeof(fidoClientPin.keyAgreementX));
+  secure_zero(fidoClientPin.keyAgreementY, sizeof(fidoClientPin.keyAgreementY));
   fidoSignCount = load_sign_count();
   FIDO_LOG("FIDO init signCount=%lu debug=%u", static_cast<unsigned long>(fidoSignCount), static_cast<unsigned>(FIDO_DEBUG));
 }
@@ -2105,7 +2638,7 @@ void fido_diag_build_json(String& outJson) {
   const uint32_t txAgo = (fidoDiag.lastTxMs == 0) ? 0 : static_cast<uint32_t>(now - fidoDiag.lastTxMs);
 
   outJson = "";
-  outJson.reserve(720);
+  outJson.reserve(1200);
   outJson += "{";
   outJson += "\"last_cid\":";
   outJson += String(fidoDiag.lastCid);
@@ -2129,6 +2662,14 @@ void fido_diag_build_json(String& outJson) {
   outJson += ",\"last_hid_error_name\":\"";
   outJson += ctaphid_err_name(fidoDiag.lastHidError);
   outJson += "\"";
+  outJson += ",\"last_report_id_seen\":";
+  outJson += String(fidoDiag.lastReportIdSeen);
+  outJson += ",\"last_report_len_seen\":";
+  outJson += String(fidoDiag.lastReportLenSeen);
+  outJson += ",\"last_report_id_dropped\":";
+  outJson += String(fidoDiag.lastReportIdDropped);
+  outJson += ",\"last_report_len_dropped\":";
+  outJson += String(fidoDiag.lastReportLenDropped);
   outJson += ",\"pending_waiting_up\":";
   outJson += (pendingCtap.active ? "true" : "false");
   outJson += ",\"rx_ms_ago\":";
@@ -2145,6 +2686,18 @@ void fido_diag_build_json(String& outJson) {
   outJson += String(fidoDiag.totalPinGateBlocks);
   outJson += ",\"up_satisfied_total\":";
   outJson += String(fidoDiag.totalUpSatisfied);
+  outJson += ",\"hid_out_callbacks_total\":";
+  outJson += String(fidoDiag.totalHidOutCallbacks);
+  outJson += ",\"hid_set_feature_callbacks_total\":";
+  outJson += String(fidoDiag.totalHidSetFeatureCallbacks);
+  outJson += ",\"hid_get_feature_callbacks_total\":";
+  outJson += String(fidoDiag.totalHidGetFeatureCallbacks);
+  outJson += ",\"unexpected_report_id_total\":";
+  outJson += String(fidoDiag.totalUnexpectedReportId);
+  outJson += ",\"dropped_bad_len_total\":";
+  outJson += String(fidoDiag.totalDroppedBadLen);
+  outJson += ",\"normalized_packets_total\":";
+  outJson += String(fidoDiag.totalNormalizedPackets);
   outJson += "}";
 }
 

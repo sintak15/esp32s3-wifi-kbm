@@ -9,9 +9,11 @@
 #include "esp32-hal-rgb-led.h"
 #include "mbedtls/md.h"
 #include "mbedtls/pkcs5.h"
+#include "mbedtls/aes.h"
 #include "mbedtls/gcm.h"
 #include "mbedtls/sha256.h"
 #include "mbedtls/ecp.h"
+#include "mbedtls/ecdh.h"
 #include "mbedtls/ecdsa.h"
 #include "USB.h"
 #include "USBHID.h"
@@ -65,6 +67,7 @@ static constexpr uint32_t HSM_PIN_UNLOCK_WINDOW_MS = 5 * 60 * 1000;
 static constexpr uint32_t HSM_PIN_PBKDF2_ITERS = 30000;
 static constexpr size_t   HSM_PIN_SALT_BYTES = 16;
 static constexpr size_t   HSM_PIN_HASH_BYTES = 32;
+static constexpr size_t   FIDO_PIN_HASH16_BYTES = 16;
 static constexpr size_t   HSM_PIN_MIN_LEN = 4;
 static constexpr size_t   HSM_PIN_MAX_LEN = 64;
 static constexpr uint32_t HSM_PRESENCE_WINDOW_MS = 15 * 1000;
@@ -108,6 +111,13 @@ static constexpr bool MODE_LED_IS_RGB = false;
 static constexpr int MODE_LED_PIN = -1;
 static constexpr bool MODE_LED_IS_RGB = false;
 #endif
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define I2C_SDA 12
+#define I2C_SCL 13
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 DNSServer dnsServer;
 WebServer server(HTTP_PORT);
@@ -176,6 +186,8 @@ static HsmState hsmState;
 static bool hsmPinConfigured = false;
 static uint8_t hsmPinSalt[HSM_PIN_SALT_BYTES] = {0};
 static uint8_t hsmPinHash[HSM_PIN_HASH_BYTES] = {0};
+static uint8_t fidoPinHash16[FIDO_PIN_HASH16_BYTES] = {0}; // left16(SHA-256(PIN)) for CTAP ClientPIN
+static bool fidoPinHash16Valid = false;
 static uint32_t hsmPinUnlockedUntil = 0;
 static uint32_t hsmPresenceUntil = 0;
 
@@ -233,6 +245,67 @@ static bool usb_mouse_click(const String& btn) {
   (void)btn;
   return false;
 #endif
+}
+
+static String serialDiagLine;
+
+static void serial_diag_print_help() {
+  Serial.println("FIDO serial diag commands:");
+  Serial.println("  diag        -> print FIDO diag JSON");
+  Serial.println("  diag reset  -> clear FIDO diag counters");
+  Serial.println("  help        -> show this help");
+}
+
+static void serial_diag_print_status() {
+  String json;
+  fido_diag_build_json(json);
+  Serial.print("FIDO_DIAG ");
+  Serial.println(json);
+}
+
+static void serial_diag_handle_line(const String& raw) {
+  String cmd = raw;
+  cmd.trim();
+  if (cmd.length() == 0) return;
+
+  if (cmd.equalsIgnoreCase("diag") || cmd.equalsIgnoreCase("diag status") || cmd.equalsIgnoreCase("status")) {
+    serial_diag_print_status();
+    return;
+  }
+
+  if (cmd.equalsIgnoreCase("diag reset") || cmd.equalsIgnoreCase("reset")) {
+    fido_diag_clear();
+    Serial.println("FIDO_DIAG reset");
+    return;
+  }
+
+  if (cmd.equalsIgnoreCase("help") || cmd.equalsIgnoreCase("?")) {
+    serial_diag_print_help();
+    return;
+  }
+
+  Serial.print("FIDO_DIAG unknown command: ");
+  Serial.println(cmd);
+  serial_diag_print_help();
+}
+
+static void serial_diag_task() {
+  while (Serial.available() > 0) {
+    const int c = Serial.read();
+    if (c < 0) break;
+    if (c == '\n' || c == '\r') {
+      if (serialDiagLine.length() > 0) {
+        serial_diag_handle_line(serialDiagLine);
+        serialDiagLine = "";
+      }
+      continue;
+    }
+    if (c >= 32 && c <= 126) {
+      if (serialDiagLine.length() < 160) {
+        serialDiagLine += static_cast<char>(c);
+      }
+    }
+  }
 }
 
 // --- HTML & JAVASCRIPT FOR THE WEB UI ---
@@ -1172,6 +1245,16 @@ static const char diag_html[] PROGMEM = R"rawliteral(
       lines.push('ctap_err_total: ' + fmt(d.ctap_err_total));
       lines.push('pin_gate_blocks_total: ' + fmt(d.pin_gate_blocks_total));
       lines.push('up_satisfied_total: ' + fmt(d.up_satisfied_total));
+      lines.push('hid_out_callbacks_total: ' + fmt(d.hid_out_callbacks_total));
+      lines.push('hid_set_feature_callbacks_total: ' + fmt(d.hid_set_feature_callbacks_total));
+      lines.push('hid_get_feature_callbacks_total: ' + fmt(d.hid_get_feature_callbacks_total));
+      lines.push('unexpected_report_id_total: ' + fmt(d.unexpected_report_id_total));
+      lines.push('dropped_bad_len_total: ' + fmt(d.dropped_bad_len_total));
+      lines.push('normalized_packets_total: ' + fmt(d.normalized_packets_total));
+      lines.push('last_report_id_seen: ' + fmt(d.last_report_id_seen));
+      lines.push('last_report_len_seen: ' + fmt(d.last_report_len_seen));
+      lines.push('last_report_id_dropped: ' + fmt(d.last_report_id_dropped));
+      lines.push('last_report_len_dropped: ' + fmt(d.last_report_len_dropped));
       document.getElementById('status').textContent = lines.join('\n');
     }
 
@@ -2667,6 +2750,65 @@ static void hsm_consume_presence() {
   hsmPresenceUntil = 0;
 }
 
+static bool fido_pin_hash16_derive(const char* pin, uint8_t outHash16[FIDO_PIN_HASH16_BYTES]) {
+  if (!pin || !outHash16) return false;
+  const size_t pinLen = strlen(pin);
+  if (pinLen < HSM_PIN_MIN_LEN || pinLen > HSM_PIN_MAX_LEN) return false;
+
+  uint8_t full[32] = {0};
+  if (mbedtls_sha256(reinterpret_cast<const uint8_t*>(pin), pinLen, full, 0) != 0) return false;
+  memcpy(outHash16, full, FIDO_PIN_HASH16_BYTES);
+  secure_zero(full, sizeof(full));
+  return true;
+}
+
+static bool fido_pin_hash16_save(const uint8_t hash16[FIDO_PIN_HASH16_BYTES]) {
+  if (!hash16) return false;
+  prefs.begin("kbm", false);
+  const size_t n = prefs.putBytes("fido_ph", hash16, FIDO_PIN_HASH16_BYTES);
+  prefs.end();
+  return n == FIDO_PIN_HASH16_BYTES;
+}
+
+static bool fido_pin_hash16_set_from_pin(const char* pin) {
+  uint8_t h[FIDO_PIN_HASH16_BYTES] = {0};
+  if (!fido_pin_hash16_derive(pin, h)) return false;
+  if (!fido_pin_hash16_save(h)) {
+    secure_zero(h, sizeof(h));
+    return false;
+  }
+  memcpy(fidoPinHash16, h, sizeof(fidoPinHash16));
+  fidoPinHash16Valid = true;
+  secure_zero(h, sizeof(h));
+  return true;
+}
+
+static void fido_pin_hash16_clear_local() {
+  fidoPinHash16Valid = false;
+  secure_zero(fidoPinHash16, sizeof(fidoPinHash16));
+}
+
+static bool fido_pin_hash16_load_from_prefs() {
+  uint8_t h[FIDO_PIN_HASH16_BYTES] = {0};
+  prefs.begin("kbm", true);
+  const size_t hl = prefs.getBytesLength("fido_ph");
+  if (hl != FIDO_PIN_HASH16_BYTES) {
+    prefs.end();
+    fido_pin_hash16_clear_local();
+    return false;
+  }
+  const size_t hg = prefs.getBytes("fido_ph", h, sizeof(h));
+  prefs.end();
+  if (hg != sizeof(h)) {
+    fido_pin_hash16_clear_local();
+    return false;
+  }
+  memcpy(fidoPinHash16, h, sizeof(fidoPinHash16));
+  fidoPinHash16Valid = true;
+  secure_zero(h, sizeof(h));
+  return true;
+}
+
 static bool hsm_pin_save_hash(const uint8_t salt[HSM_PIN_SALT_BYTES], const uint8_t hash[HSM_PIN_HASH_BYTES]) {
   if (!salt || !hash) return false;
   prefs.begin("kbm", false);
@@ -2681,12 +2823,14 @@ static void hsm_pin_clear_local() {
   hsmPinUnlockedUntil = 0;
   secure_zero(hsmPinSalt, sizeof(hsmPinSalt));
   secure_zero(hsmPinHash, sizeof(hsmPinHash));
+  fido_pin_hash16_clear_local();
 }
 
 static void hsm_pin_clear_prefs() {
   prefs.begin("kbm", false);
   prefs.remove("hsm_ps");
   prefs.remove("hsm_ph");
+  prefs.remove("fido_ph");
   prefs.end();
   hsm_pin_clear_local();
 }
@@ -2726,6 +2870,7 @@ static bool hsm_pin_set(const char* pin) {
   memcpy(hsmPinHash, hash, sizeof(hsmPinHash));
   hsmPinConfigured = true;
   hsmPinUnlockedUntil = millis() + HSM_PIN_UNLOCK_WINDOW_MS;
+  (void)fido_pin_hash16_set_from_pin(pin);
   secure_zero(hash, sizeof(hash));
   return true;
 }
@@ -2752,6 +2897,7 @@ static bool hsm_pin_load_from_prefs() {
   memcpy(hsmPinHash, hash, sizeof(hsmPinHash));
   hsmPinConfigured = true;
   hsmPinUnlockedUntil = 0;
+  (void)fido_pin_hash16_load_from_prefs();
   return true;
 }
 
@@ -2759,6 +2905,9 @@ static bool hsm_pin_unlock_with_pin(const char* pin) {
   if (!hsmPinConfigured) return false;
   if (!hsm_pin_verify(pin)) return false;
   hsmPinUnlockedUntil = millis() + HSM_PIN_UNLOCK_WINDOW_MS;
+  if (!fidoPinHash16Valid) {
+    (void)fido_pin_hash16_set_from_pin(pin);
+  }
   return true;
 }
 
@@ -2769,6 +2918,13 @@ bool security_pin_configured() {
 
 bool security_pin_unlocked_now() {
   return (!hsmPinConfigured) || hsm_pin_unlocked();
+}
+
+bool security_fido_pin_hash16_get(uint8_t outHash16[16]) {
+  if (!outHash16) return false;
+  if (!hsmPinConfigured || !fidoPinHash16Valid) return false;
+  memcpy(outHash16, fidoPinHash16, 16);
+  return true;
 }
 
 bool security_presence_satisfied_now() {
@@ -4122,6 +4278,18 @@ void setup() {
   // Prevent loop-task watchdog resets from dropping USB during those operations.
   disableLoopWDT();
 
+  Wire.begin(I2C_SDA, I2C_SCL);
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
+    Serial.println(F("SSD1306 allocation failed"));
+  } else {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0,0);
+    display.println("ESP32-S3 KBM Ready");
+    display.display();
+  }
+
   load_pair_token();
   load_totp_config();
   attestationProfile = load_attestation_profile();
@@ -4134,6 +4302,8 @@ void setup() {
   fido_begin();
 
   Serial.println("Triple-tap BOOT to enable portal pairing.");
+  serial_diag_print_help();
+  serial_diag_print_status();
 
 #if FIDO_STABILITY_MODE
   // Disable radio during FIDO transport troubleshooting to minimize USB dropouts.
@@ -4145,9 +4315,17 @@ void setup() {
 }
 
 void loop() {
+  static uint32_t lastDisplayUpdate = 0;
+
   fido_task();
+  serial_diag_task();
   poll_boot_button();
   update_status_led();
+
+  if (millis() - lastDisplayUpdate > 500) {
+    update_display();
+    lastDisplayUpdate = millis();
+  }
 
 #if !FIDO_STABILITY_MODE
   dnsServer.processNextRequest();
@@ -4155,4 +4333,43 @@ void loop() {
 #endif
 
   delay(1); // yield to WiFi/USB stacks
+}
+
+static void update_display() {
+  if (OLED_RESET == -1 && !display.getBufferPtr()) return; // Display not initialized
+
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(0, 0);
+
+  char code[16];
+  uint32_t rem = 0;
+  if (totpKeyLen > 0 && generate_totp(code, sizeof(code), &rem)) {
+    display.setCursor(14, 10);
+    // Add a space between 3-digit groups for readability
+    if (strlen(code) == 6) {
+      char spaced_code[8];
+      strncpy(spaced_code, code, 3);
+      spaced_code[3] = ' ';
+      strncpy(spaced_code + 4, code + 3, 3);
+      spaced_code[7] = '\0';
+      display.print(spaced_code);
+    } else {
+      display.print(code);
+    }
+    
+    display.setTextSize(1);
+    display.setCursor(0, 40);
+    display.print("Code refreshes in ");
+    display.print(rem);
+    display.println("s");
+
+    int barWidth = map(rem, 0, totpPeriodS, 0, SCREEN_WIDTH);
+    display.fillRect(0, SCREEN_HEIGHT - 5, barWidth, 5, SSD1306_WHITE);
+  } else {
+    display.setTextSize(1);
+    display.setCursor(0, 10);
+    display.println("TOTP not configured or time not synced.");
+  }
+  display.display();
 }
